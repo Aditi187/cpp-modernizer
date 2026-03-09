@@ -120,4 +120,3 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str: 
 
 if __name__ == "__main__":  # This line checks whether this file is being run directly as a script rather than being imported as a module.
     mcp_server.run()  # This line starts the MCP server event loop, so the AI client can connect and call the read_code and run_compiler tools.
-

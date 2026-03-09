@@ -29,7 +29,10 @@ def _compile_and_run_cpp(
             shell=True,  # This flag runs the command through the system shell.
             capture_output=True,  # This flag captures both stdout and stderr from the compiler.
             text=True,  # This flag decodes the captured output as text strings.
+            timeout=10,  # This flag enforces a hard 10-second timeout so compilation cannot hang indefinitely.
         )  # This closing parenthesis ends the subprocess.run call.
+    except subprocess.TimeoutExpired as exc:  # This except block catches the case where compilation takes too long.
+        return "", f"Compilation timed out: {exc!r}", False  # This return reports the timeout as a compilation failure.
     except Exception as exc:  # This except block catches any error while trying to run the compiler.
         return "", f"Compilation failed: {exc!r}", False  # This return gives an empty stdout, an error message in stderr, and success=False.
 
@@ -43,8 +46,11 @@ def _compile_and_run_cpp(
             shell=True,  # This flag runs the executable through the shell so it can be found and executed.
             capture_output=True,  # This flag captures the program's stdout and stderr.
             text=True,  # This flag decodes the captured output as text.
+            timeout=10,  # This flag enforces a hard 10-second timeout to protect against infinite loops in generated code.
         )  # This closing parenthesis ends the subprocess.run call.
-    except Exception as exc:  # This except block catches any error while trying to run the executable.
+    except subprocess.TimeoutExpired as exc:  # This except block catches the case where the executable runs for too long.
+        return "", f"Execution timed out: {exc!r}", False  # This return reports the timeout as an execution failure.
+    except Exception as exc:  # This except block catches any other error while trying to run the executable.
         return "", f"Execution failed: {exc!r}", False  # This return reports the execution failure with an error message.
 
     stdout_text = (run_result.stdout or "").strip()  # This line extracts and trims the program's standard output.
@@ -52,23 +58,40 @@ def _compile_and_run_cpp(
     return stdout_text, stderr_text, True  # This return passes back the outputs and success=True because both compile and run succeeded.
 
 
+def _normalize_output(text: str) -> str:  # This helper normalizes program output for fuzzy comparison.
+    """
+    Normalize output by:
+      - converting all newlines to '\\n',
+      - stripping trailing whitespace from each line,
+      - and trimming trailing blank lines.  # This docstring explains that we ignore superficial formatting differences.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")  # This line normalizes different newline conventions to '\\n'.
+    lines = normalized.split("\n")  # This line splits into logical lines without newline characters.
+    stripped_lines = [line.rstrip() for line in lines]  # This line removes trailing spaces and tabs from each line.
+    # Drop trailing blank lines to avoid spurious differences at the end of output.
+    while stripped_lines and stripped_lines[-1] == "":
+        stripped_lines.pop()
+    return "\n".join(stripped_lines)  # This line rejoins the normalized lines into a single string.
+
+
 def run_differential_test(
     original_cpp_path: str,
     modernized_code: str,
     gpp_exe: str = r"C:\msys64\mingw64\bin\g++.exe",
-) -> bool:
+) -> tuple[bool, str]:
     """
     Run the differential test: compile and run both original and modernized code, then compare outputs.  # This docstring explains the main entry point.
-    Returns True if outputs are identical (functional parity confirmed); False otherwise.  # This line documents the return value.
+    Returns (parity_ok, diff_text) where diff_text is empty on success, or a unified diff
+    string when outputs differ.  # This line documents the return value.
     """  # This closing triple quote ends the docstring.
 
     if not os.path.isfile(original_cpp_path):  # This check ensures the original C++ file exists before we try to compile it.
         print(f"ERROR: Original file not found: {original_cpp_path}")  # This print informs the user that the path is invalid.
-        return False  # This return signals failure so the caller knows the test could not run.
+        return False, ""  # This return signals failure so the caller knows the test could not run.
 
     if not modernized_code.strip():  # This check ensures we have actual modernized code to test; empty input would be meaningless.
         print("ERROR: No modernized code provided.")  # This print tells the user that the modernized code string was empty.
-        return False  # This return signals failure so the caller knows the test could not run.
+        return False, ""  # This return signals failure so the caller knows the test could not run.
 
     with tempfile.TemporaryDirectory() as tmp_dir:  # This context manager creates a temporary directory that will be cleaned up when we are done.
         modernized_cpp_path = os.path.join(tmp_dir, "modernized.cpp")  # This line builds the path for the temporary modernized source file.
@@ -87,7 +110,7 @@ def run_differential_test(
         if not orig_ok:  # This condition checks whether the original code failed to compile or run.
             print("ORIGINAL FAILED:")  # This print marks the section that shows why the original failed.
             print(orig_stderr)  # This print shows the compiler or runtime error from the original code.
-            return False  # This return stops the test because we cannot compare outputs if the original did not run successfully.
+            return False, ""  # This return stops the test because we cannot compare outputs if the original did not run successfully.
 
         print("Compiling and running MODERNIZED code...")  # This print tells the user that we are now processing the modernized code.
         mod_stdout, mod_stderr, mod_ok = _compile_and_run_cpp(  # This line calls our helper to compile and run the modernized code.
@@ -100,29 +123,36 @@ def run_differential_test(
         if not mod_ok:  # This condition checks whether the modernized code failed to compile or run.
             print("MODERNIZED FAILED:")  # This print marks the section that shows why the modernized code failed.
             print(mod_stderr)  # This print shows the compiler or runtime error from the modernized code.
-            return False  # This return stops the test because we cannot compare outputs if the modernized code did not run successfully.
+            return False, ""  # This return stops the test because we cannot compare outputs if the modernized code did not run successfully.
 
-        if orig_stdout == mod_stdout:  # This condition checks whether the two programs produced identical standard output.
+        # Normalize outputs to ignore trailing spaces and newline style differences.
+        norm_orig = _normalize_output(orig_stdout)
+        norm_mod = _normalize_output(mod_stdout)
+
+        if norm_orig == norm_mod:  # This condition checks whether the two normalized outputs are identical.
             print("PASSED: Functional Parity Confirmed")  # This print is the exact message requested when outputs match.
-            return True  # This return signals success so the caller knows functional parity was confirmed.
+            return True, ""  # This return signals success so the caller knows functional parity was confirmed.
 
         print("FAILED: Outputs differ. Here is exactly what changed:")  # This print tells the user that parity was not confirmed and a diff follows.
         print("-" * 60)  # This print adds a visual separator so the diff is easy to spot.
 
-        orig_lines = orig_stdout.splitlines(keepends=True)  # This line splits the original output into lines, keeping newlines so the diff is accurate.
-        mod_lines = mod_stdout.splitlines(keepends=True)  # This line splits the modernized output into lines in the same way.
+        orig_lines = (norm_orig + "\n").splitlines(keepends=True)  # This line splits the normalized original output into lines, keeping newlines so the diff is accurate.
+        mod_lines = (norm_mod + "\n").splitlines(keepends=True)  # This line splits the normalized modernized output into lines in the same way.
 
         diff_lines = unified_diff(  # This call generates a unified diff between the two outputs so you can see exactly what changed.
-            orig_lines,  # This argument is the original output as a list of lines.
-            mod_lines,  # This argument is the modernized output as a list of lines.
+            orig_lines,  # This argument is the normalized original output as a list of lines.
+            mod_lines,  # This argument is the normalized modernized output as a list of lines.
             fromfile="Original (test.cpp)",  # This label appears in the diff header for the first file.
             tofile="Modernized",  # This label appears in the diff header for the second file.
         )  # This closing parenthesis ends the unified_diff call.
 
+        diff_text_parts: list[str] = []  # This list will accumulate the diff lines both for printing and for returning to callers.
         for line in diff_lines:  # This loop iterates over each line of the generated diff.
+            diff_text_parts.append(line)  # This line records the diff line.
             print(line, end="")  # This print outputs the diff line; end="" avoids adding an extra newline since lines may already have one.
 
-        return False  # This return signals failure so the caller knows the AI should fix its logic to match the original behavior.
+        diff_text = "".join(diff_text_parts)  # This line joins the diff lines into a single string.
+        return False, diff_text  # This return signals failure so the caller knows the AI should fix its logic to match the original behavior and provides the diff.
 
 
 if __name__ == "__main__":  # This block runs only when this file is executed as a script (e.g. python -m core.differential_tester), not when imported.
@@ -146,5 +176,5 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
         print("ERROR: Provide modernized code as second argument or path to file containing it.")  # This print tells the user what is missing.
         sys.exit(1)  # This line exits because we cannot proceed without the modernized code.
 
-    success = run_differential_test(orig_path, modernized_code)  # This line runs the full differential test and captures the result.
+    success, _diff_text = run_differential_test(orig_path, modernized_code)  # This line runs the full differential test and captures the result.
     sys.exit(0 if success else 1)  # This line exits with 0 on success (parity confirmed) or 1 on failure, for use in scripts or CI.

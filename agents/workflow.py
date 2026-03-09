@@ -19,7 +19,12 @@ import requests  # This import allows us to make HTTP requests to check if the l
 
 from langchain_ollama import ChatOllama  # This import provides the chat interface to models served by Ollama (e.g. deepseek-coder).
 
-from core.parser import extract_functions_from_cpp_file  # This import brings in our Tree-sitter parser so the analyzer node can find function blocks in C++ files.
+from core.parser import extract_functions_from_cpp_file  # This import brings in our Tree-sitter-based helper to extract functions from a C++ file.
+from core.graph import (  # This grouped import brings in helpers to build and analyze the function dependency graph.
+    DependencyGraph,
+    build_analysis_report,
+)  # This closing parenthesis ends the grouped import from core.graph.
+from core.differential_tester import run_differential_test  # This import brings in the differential tester used to check functional parity.
 
 
 def check_ollama_health() -> bool:
@@ -44,16 +49,31 @@ class ModernizationState(TypedDict):
     """State object passed through the workflow"""
     code: str  # This field holds either the raw source code text or a path to a source file, depending on how the workflow is invoked.
     language: str  # This field records the language name (for example "cpp"), so nodes can adjust behavior based on the language.
-    analysis: str  # This field stores a JSON-formatted string describing analysis results such as discovered functions.
+    analysis: str  # This field stores a JSON-formatted string describing analysis results such as discovered functions and graph metrics.
+    dependency_map: dict[str, list[str]]  # This field stores a call-graph style dependency map: function name -> list of functions it calls.
+    call_graph_data: dict[str, Any]  # This field stores a JSON-serializable view of the call graph (nodes and edges) for visualization and analysis.
+    impact_map: dict[str, list[str]]  # This field stores which functions call which (alias of dependency_map for clarity in prompts).
+    orphans: list[str]  # This field stores a list of functions that have no callers in the local call graph.
+    analysis_report: str  # This field stores a concise human-readable summary of the codebase / translation unit structure.
     modernized_code: str  # This field holds the most recent modernized version of the code produced by the modernizer node.
     verification_result: dict  # This field records the outcome of compiling the modernized code, including success flag and any errors.
     error_log: str  # This field accumulates human-readable error messages that should be fed back into the model for retries.
     attempt_count: int  # This field tracks how many times the modernizer node has been run, which controls the retry loop.
+    is_parity_passed: bool  # This field records whether the most recent differential test confirmed functional parity.
+    is_functionally_equivalent: bool  # This field records whether the latest tester run declared the modernized code functionally equivalent.
+    diff_output: str  # This field stores the unified diff from the tester when outputs differ.
+    feedback_loop_count: int  # This field counts how many times we have routed back into the modernizer for self-healing.
 
 
 def analyzer_node(state: ModernizationState) -> ModernizationState:
     """
-    Node 1: Analyzer - Finds and catalogs old code patterns
+    Node 1: Analyzer - Graph-aware analysis of legacy code.
+
+    This node:
+      - Uses CppParser to extract function definitions and their calls.
+      - Builds a DependencyGraph of functions using networkx.
+      - Identifies orphan functions (no callers) and circular recursions (cycles).
+      - Produces both a machine-friendly JSON analysis and a human-readable analysis_report.
     """
     print("\n🔍 ANALYZER NODE")  # This print helps you see in the console when the analyzer node is running.
     print(f"Language: {state['language']}")  # This print shows which language label the workflow thinks it is processing.
@@ -62,7 +82,12 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether the language label indicates C++, which is when we want to use the Tree-sitter parser.
 
     functions_info = []  # type: ignore[var-annotated]  # This variable will hold the list of functions discovered by the parser, if any.
+    dependency_map: dict[str, list[str]] = {}  # This dictionary will map each function name to the list of functions it calls.
     parser_error: str = ""  # This string will store any error message encountered while trying to parse the code.
+    orphans: list[str] = []  # This list will store functions with no callers.
+    cycles: list[list[str]] = []  # This list will store any detected circular recursion cycles.
+    analysis_report: str = ""  # This string will hold a concise human-readable summary of the code structure.
+    call_graph_data: dict[str, Any] = {}  # This dictionary will store a JSON-serializable view of the call graph.
 
     if is_cpp:  # This condition ensures we only run the C++ parser when we are actually working with C++ code.
         code_value = state["code"]  # This line saves the code field to a shorter variable name, which may be either text or a file path.
@@ -83,25 +108,127 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
             temp_file.close()  # This line closes the temporary file handle so there are no open descriptors left when the parser runs.
             cpp_path = temp_file_path  # This line sets the parser input path to the newly created temporary C++ file.
 
-        try:  # This try block attempts to run the parser on the chosen C++ file path.
-            functions_info = extract_functions_from_cpp_file(cpp_path)  # type: ignore[arg-type]  # This call uses our Tree-sitter-based helper to find function names and bodies.
-        except Exception as exc:  # This except block catches any parsing-related errors so they do not crash the workflow.
-            parser_error = f"Analyzer failed to parse C++ file: {exc!r}"  # This line records a human-readable message explaining why parsing failed.
-        finally:  # This block always runs, whether parsing succeeded or failed.
+        try:  # This try block attempts to run the parser on the chosen C++ file path and build a dependency graph.
+            functions_info = extract_functions_from_cpp_file(cpp_path)  # type: ignore[arg-type]  # This call extracts function definitions, calls, and byte spans.
+
+            dep_graph = DependencyGraph(functions_info)  # This line constructs a DependencyGraph object from the function metadata.
+            dependency_map = dep_graph.dependency_map  # This line reads the caller -> callees adjacency list.
+
+            graph_metrics = dep_graph.analyze()  # This line analyzes orphans and cycles in the call graph.
+            orphans = list(graph_metrics.get("orphans", []))  # This line records the set of orphan functions.
+            cycles = list(graph_metrics.get("cycles", []))  # This line records the list of cycles.
+
+            analysis_report = build_analysis_report(functions_info, dependency_map, orphans, cycles)  # This line builds a concise human-readable report.
+            call_graph_data = dep_graph.to_dict()  # This line exports the call graph as simple nodes/edges data for visualization and prompts.
+        except Exception as exc:  # This except block catches any parsing- or graph-related errors so they do not crash the workflow.
+            parser_error = f"Analyzer failed to parse or analyze C++ file: {exc!r}"  # This line records a human-readable message explaining why analysis failed.
+        finally:  # This block always runs, whether analysis succeeded or failed.
             if temp_file_path is not None and os.path.exists(temp_file_path):  # This check ensures we only delete the temporary file if we actually created one and it still exists.
                 os.remove(temp_file_path)  # This line deletes the temporary file to avoid leaving unnecessary files on disk.
 
     analysis: dict[str, Any] = {  # This dictionary will hold the structured analysis information that we will turn into JSON.
         "language": state["language"],  # This entry records the language label that was used for this analysis.
+        "functions": functions_info,  # This entry stores detailed per-function metadata including names, calls, and byte spans.
         "function_summary": {  # This nested dictionary describes the functions we discovered (if any).
             "count": len(functions_info),  # This entry records how many functions the parser found in the C++ file.
             "names": [fn.get("name", "") for fn in functions_info],  # This list comprehension collects just the function names from the parser output.
         },  # This closing brace ends the function_summary dictionary.
+        "dependency_map": dependency_map,  # This entry captures the call-graph style function dependency map for the current translation unit.
+        "call_graph_data": call_graph_data,  # This entry stores a simple nodes/edges representation of the call graph.
+        "orphans": orphans,  # This entry records functions that have no callers.
+        "cycles": cycles,  # This entry records any circular recursion cycles in the call graph.
+        "analysis_report": analysis_report,  # This entry stores a concise human-readable description of the code structure.
         "parser_error": parser_error,  # This entry stores any error message from the parser, or an empty string if everything went fine.
     }  # This closing brace ends the analysis dictionary.
 
-    state["analysis"] = json.dumps(analysis, indent=2)  # This line converts the analysis dictionary into a human-readable JSON string and stores it in the state.
+    state["analysis"] = json.dumps(analysis, indent=2, sort_keys=True)  # This line converts the analysis dictionary into a stable, human-readable JSON string and stores it in the state.
+    state["dependency_map"] = dependency_map  # This line stores the raw dependency map separately so downstream nodes can consume it without re-parsing JSON.
+    state["call_graph_data"] = call_graph_data  # This line stores the simple call graph data for downstream nodes and visualization.
+    state["impact_map"] = dependency_map  # This line aliases the dependency_map as impact_map to emphasize its use in prompts.
+    state["orphans"] = orphans  # This line stores the list of orphan functions so downstream nodes can choose to prune them.
+    state["analysis_report"] = analysis_report  # This line stores the human-readable report so it can be included in prompts if desired.
     print(f"Analysis (JSON):\n{state['analysis']}")  # This print displays the analysis JSON in the console so you can see exactly what the analyzer found.
+
+    return state  # This return passes the updated state object along to the next node in the workflow.
+
+
+def pruner_node(state: ModernizationState) -> ModernizationState:
+    """
+    Node 2: Pruner - Removes orphan code (except main) before modernization.
+
+    This node:
+      - Reads the function metadata and orphan list from the deep analyzer.
+      - Uses AST byte ranges to surgically remove orphan function definitions from the
+        source text, except for the entry point 'main'.
+      - Updates state["code"] with a pruned version to reduce the LLM's workload.
+    """
+    print("\n✂️  PRUNER NODE")  # This print marks the start of the pruning step in the console.
+
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether we are working with C++ code.
+    if not is_cpp:  # This condition skips pruning for non-C++ languages.
+        print("Pruner: skipping (non-C++ language).")
+        return state  # This return leaves the state unchanged.
+
+    if not state.get("analysis"):  # This condition ensures that we only run if the deep analyzer produced analysis.
+        print("Pruner: no analysis found, skipping pruning.")
+        return state  # This return leaves the state unchanged.
+
+    try:
+        analysis_obj = json.loads(state["analysis"])  # This line parses the JSON analysis string into a Python dictionary.
+    except json.JSONDecodeError:
+        print("Pruner: failed to parse analysis JSON, skipping pruning.")  # This print warns that analysis could not be decoded.
+        return state  # This return leaves the state unchanged.
+
+    functions_info = analysis_obj.get("functions") or []  # This line reads the detailed function metadata list.
+    orphans = state.get("orphans") or analysis_obj.get("orphans") or []  # This line prefers the orphans recorded on the state but falls back to the analysis JSON.
+    if not functions_info or not orphans:  # This condition checks whether there is anything to prune.
+        print("Pruner: no functions or no orphans detected, skipping pruning.")  # This print explains why no pruning will happen.
+        return state  # This return leaves the state unchanged.
+
+    # We never prune the program entry point 'main', even if it has no callers.
+    orphans_to_prune = {str(name) for name in orphans if str(name) != "main"}  # This set records orphan function names that are eligible for pruning.
+    if not orphans_to_prune:
+        print("Pruner: orphan list only contains 'main' or is empty, nothing to prune.")  # This print explains that we intentionally keep main.
+        return state  # This return leaves the state unchanged.
+
+    original_code = state["code"]  # This line reads the original source code text from the state.
+    original_bytes = original_code.encode("utf-8")  # This line encodes the code as UTF-8 bytes so we can use Tree-sitter byte offsets.
+
+    # Collect byte-span ranges for every function definition that should be removed.
+    spans_to_remove: list[tuple[int, int]] = []  # This list will hold (start_byte, end_byte) pairs for orphan functions.
+    for fn in functions_info:  # This loop inspects each function metadata entry.
+        name = str(fn.get("name") or "")  # This line normalizes the function name.
+        if name not in orphans_to_prune:  # This condition ensures we only consider orphan functions for pruning.
+            continue
+        start_byte = fn.get("start_byte")
+        end_byte = fn.get("end_byte")
+        if isinstance(start_byte, int) and isinstance(end_byte, int) and 0 <= start_byte <= end_byte <= len(original_bytes):  # This condition validates the byte span.
+            spans_to_remove.append((start_byte, end_byte))  # This line records the valid span.
+
+    if not spans_to_remove:  # This condition checks whether we have any valid spans to delete.
+        print("Pruner: no valid byte spans found for orphan functions, skipping pruning.")  # This print explains why pruning will not proceed.
+        return state  # This return leaves the state unchanged.
+
+    spans_to_remove.sort(key=lambda pair: pair[0])  # This line sorts the spans by starting offset so we can rebuild the code in order.
+
+    # Rebuild the code bytes, skipping over the regions marked for removal.
+    new_chunks: list[bytes] = []  # This list will hold the surviving segments of the original code.
+    cursor = 0  # This integer tracks our current position in the original byte array.
+    for start_byte, end_byte in spans_to_remove:  # This loop processes each span to remove.
+        if start_byte < cursor:  # This condition skips spans that overlap with or are fully contained in a previously removed region.
+            continue
+        if start_byte > cursor:  # This condition preserves the code between the previous cursor and the start of this span.
+            new_chunks.append(original_bytes[cursor:start_byte])
+        cursor = end_byte  # This line moves the cursor past the removed span.
+
+    if cursor < len(original_bytes):  # This condition ensures we keep any trailing code after the last removed span.
+        new_chunks.append(original_bytes[cursor:])
+
+    pruned_bytes = b"".join(new_chunks)  # This line concatenates all preserved segments into a single byte string.
+    pruned_code = pruned_bytes.decode("utf-8", errors="replace")  # This line decodes the pruned bytes back into text.
+
+    state["code"] = pruned_code  # This line updates the state with the pruned source code so the modernizer works on a smaller, focused input.
+    print(f"✂️  Pruning {len(spans_to_remove)} orphan function(s): {', '.join(sorted(orphans_to_prune))}")  # This print summarizes what was removed in a visually distinct way.
 
     return state  # This return passes the updated state object along to the next node in the workflow.
 
@@ -114,8 +241,8 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     print("\n✏️  MODERNIZER NODE")  # This print marks the start of a modernization attempt in the console.
     print(f"Attempt: {state['attempt_count']}")  # This print shows how many modernization attempts have already been made.
 
-    if state["error_log"]:  # This condition checks whether the verifier reported any previous compilation errors.
-        print(f"Previous Errors:\n{state['error_log']}")  # This print shows those errors so you can see what the model is being asked to fix.
+    if state["error_log"]:  # This condition checks whether the verifier or tester reported any previous issues.
+        print(f"Previous Feedback:\n{state['error_log']}")  # This print shows that feedback so you can see what the model is being asked to fix.
 
     # Decide which version of the code we want to improve: the last modernized version (if any) or the original legacy code.
     source_to_improve = state["modernized_code"] or state["code"]  # This line prefers the most recent modernized code but falls back to the original code on the first attempt.
@@ -135,16 +262,73 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             "Always use proper C++ syntax (for example: 'int main()', 'auto', 'void', correct return types, and semicolons). "
             "Rewrite the given legacy C++ code into clean, idiomatic, and safe C++20 while preserving the original behavior."
         )  # This comment explains that we clearly tell the model to avoid JavaScript-style code and stick to real C++20.
-        if state["analysis"]:  # This condition checks whether the analyzer produced any structured information about functions.
-            prompt_parts.append(  # This call adds a section containing the analyzer's JSON output so the model can see function structure.
-                "Here is a JSON analysis of the current code (functions and metadata):\n"
+        analysis_obj = None
+        if state["analysis"]:  # This condition checks whether the deep analyzer produced any structured information about functions.
+            prompt_parts.append(  # This call adds a section containing the analyzer's JSON output so the model can see function structure and dependencies.
+                "Here is a JSON analysis of the current code (functions, metadata, function dependency map, orphan functions, and cycles):\n"
                 f"{state['analysis']}"
-            )  # This comment clarifies that we are sharing function-level analysis with the model.
-        if state["error_log"]:  # This condition checks whether previous compilation attempts produced errors that need to be fixed.
-            prompt_parts.append(  # This call adds a section describing the last compilation errors, which the model should address.
-                "Here are compilation errors from the last attempt. Fix these while modernizing:\n"
-                f"{state['error_log']}"
-            )  # This comment clarifies that we expect the model to use these errors as feedback for corrections.
+            )  # This comment clarifies that we are sharing a rich, graph-aware analysis with the model.
+            try:
+                analysis_obj = json.loads(state["analysis"])  # This line parses the analysis JSON so we can use function signatures and comments.
+            except json.JSONDecodeError:
+                analysis_obj = None  # This line safely falls back if the JSON cannot be parsed.
+        if state.get("dependency_map"):  # This condition checks whether we have a non-empty dependency map to share explicitly.
+            prompt_parts.append(  # This call adds a compact, focused view of the dependency map so the model can quickly see the local call graph.
+                "Here is a concise JSON function dependency map for this translation unit:\n"
+                f"{json.dumps(state['dependency_map'], indent=2, sort_keys=True)}"
+            )  # This comment clarifies that we provide a focused call graph optimized for the model's consumption.
+            # Derive caller information from the dependency_map so we can describe per-function context.
+            dep_map = state["dependency_map"]
+            callers_map: dict[str, list[str]] = {name: [] for name in dep_map.keys()}  # This dictionary will map each function to the list of functions that call it.
+            for caller_name, callees in dep_map.items():  # This loop inverts the adjacency list to build the callers map.
+                for callee_name in callees:
+                    if callee_name in callers_map and caller_name not in callers_map[callee_name]:
+                        callers_map[callee_name].append(caller_name)
+
+            per_function_context_lines: list[str] = []  # This list will hold human-readable context lines for each function.
+            signatures_by_name: dict[str, str] = {}
+            comments_by_name: dict[str, str] = {}
+            if isinstance(analysis_obj, dict):
+                for fn_info in analysis_obj.get("functions", []):  # This loop builds lookup tables for signatures and comments by function name.
+                    fn_name = str(fn_info.get("name") or "")
+                    if not fn_name:
+                        continue
+                    if "signature" in fn_info:
+                        signatures_by_name[fn_name] = str(fn_info.get("signature") or "")
+                    if "comments" in fn_info:
+                        comments_by_name[fn_name] = str(fn_info.get("comments") or "")
+
+            for fn_name in sorted(dep_map.keys()):  # This loop builds a context sentence for each function in the translation unit.
+                callers = sorted(callers_map.get(fn_name, []))
+                callees = dep_map.get(fn_name, [])
+                callers_str = ", ".join(callers) if callers else "none"
+                callees_str = ", ".join(callees) if callees else "none"
+                signature_text = signatures_by_name.get(fn_name, "")
+                comments_text = comments_by_name.get(fn_name, "")
+                signature_fragment = f" Signature: {signature_text}" if signature_text else ""
+                comments_fragment = f" Documentation: {comments_text}" if comments_text else ""
+                per_function_context_lines.append(
+                    f"- You are modernizing function '{fn_name}'. It is called by [{callers_str}] and it calls [{callees_str}].{signature_fragment}{comments_fragment} Ensure the interface remains compatible with its callers and callees."
+                )
+
+            prompt_parts.append(
+                "Function-level call graph context (for each function, who calls it and what it calls):\n"
+                + "\n".join(per_function_context_lines)
+            )  # This comment explains that we explicitly describe per-function context to the model.
+        if state["error_log"]:  # This condition checks whether previous attempts produced any feedback that needs to be fixed.
+            # Distinguish between compiler failures and parity (logic) failures so we can give targeted instructions.
+            if state["verification_result"].get("success") and not state.get("is_functionally_equivalent", True):
+                diff_text = state.get("diff_output") or state["error_log"]
+                prompt_parts.append(  # This call adds a section explicitly describing the parity failure and unified diff output.
+                    "The code compiled, but the output changed. Fix the logic to ensure functional parity with the original program.\n"
+                    "Here is a unified diff between the original and modernized program outputs:\n"
+                    f"{diff_text}"
+                )
+            else:
+                prompt_parts.append(  # This call adds a section describing the last compilation errors, which the model should address.
+                    "Here are compilation errors from the last attempt. Fix these while modernizing:\n"
+                    f"{state['error_log']}"
+                )  # This comment clarifies that we expect the model to use these errors as feedback for corrections.
         prompt_parts.append(  # This call adds the actual source code and the final instructions on how to respond.
             "Here is the code to modernize into valid C++20:\n"
             "```cpp\n"
@@ -282,19 +466,96 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
     return state  # This return passes the updated state (including verification results) back into the LangGraph router.
 
 
+def tester_node(state: ModernizationState) -> ModernizationState:
+    """
+    Node 4: Tester - Runs a differential test to check functional parity.
+
+    This node:
+      - Only runs when compilation succeeded.
+      - Uses run_differential_test to compare outputs of the original and modernized code.
+      - Sets is_parity_passed and, on failure, records a unified diff in error_log so
+        the modernizer can perform a self-healing pass focused on logic parity.
+    """
+    print("\n🧪 TESTER NODE")  # This print marks the start of the tester step in the console.
+
+    # Reset parity / equivalence flags and previous diff output before running a new test.
+    state["is_parity_passed"] = True  # This line pessimistically assumes parity will pass; we flip it to False on failure.
+    state["is_functionally_equivalent"] = True  # This line assumes functional equivalence until the tester proves otherwise.
+    state["diff_output"] = ""  # This line clears any previous diff output.
+
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether we are working with C++ code.
+    if not is_cpp:
+        print("Tester: skipping (non-C++ language).")
+        return state  # This return leaves the state unchanged for non-C++ code.
+
+    if not state["verification_result"].get("success"):  # This condition ensures we only run the tester when compilation succeeded.
+        print("Tester: skipping because compilation failed.")  # This print clarifies why we do not run the differential test.
+        state["is_parity_passed"] = False  # This line records that parity has not been confirmed.
+        state["is_functionally_equivalent"] = False
+        return state  # This return leaves error_log with compiler errors.
+
+    if not state["modernized_code"].strip():  # This condition checks that we have modernized code to test.
+        print("Tester: skipping because modernized_code is empty.")  # This print explains why the tester is being skipped.
+        state["is_parity_passed"] = False
+        state["is_functionally_equivalent"] = False
+        return state
+
+    # The differential tester expects a path to the original C++ file. In this workflow,
+    # we assume the original is test.cpp at the project root (same as the __main__ block).
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # This line gets the project root directory where test.cpp lives.
+    original_cpp_path = os.path.join(base_dir, "test.cpp")  # This line builds the full path to test.cpp in the project root.
+
+    if not os.path.isfile(original_cpp_path):
+        print(f"Tester: original C++ file not found at {original_cpp_path}, skipping parity test.")  # This print warns that we cannot run the differential test.
+        state["is_parity_passed"] = False
+        state["is_functionally_equivalent"] = False
+        return state
+
+    print("🧪 Running differential test for functional parity...")  # This print signals that we are about to run the parity test.
+    parity_ok, diff_text = run_differential_test(original_cpp_path, state["modernized_code"])  # This line runs the differential test and captures both status and diff.
+
+    state["is_parity_passed"] = bool(parity_ok)  # This line records whether the latest parity test passed.
+    state["is_functionally_equivalent"] = bool(parity_ok)  # This line mirrors the parity result into the functionally-equivalent flag.
+
+    if parity_ok:
+        print("✅ Parity Test PASSED (outputs match).")  # This print confirms that the modernized code matches the original program output.
+        return state
+
+    # On parity failure, store the unified diff so the modernizer can fix logic.
+    print("❌ Parity Test FAILED (outputs differ).")  # This print reports that the outputs do not match.
+    state["diff_output"] = diff_text  # This line stores the unified diff for the modernizer prompt.
+    state["error_log"] = diff_text  # This line mirrors the diff into error_log for backward-compatible prompts and logging.
+
+    return state  # This return passes the updated state (including parity info) back into the LangGraph router.
+
+
 def should_retry(state: ModernizationState) -> str:
     """
     Router function: Decides whether to retry modernization or proceed to END
     """
-    if state["verification_result"].get("success"):
-        print("\n→ Routing to END (SUCCESS)")
+    verification_success = bool(state["verification_result"].get("success"))  # This line normalizes the compilation success flag.
+    parity_passed = bool(state.get("is_functionally_equivalent", False))  # This line reads whether the last differential test declared functional equivalence.
+    feedback_loops = int(state.get("feedback_loop_count", 0))  # This line reads how many times we have already looped back into the modernizer.
+
+    # Hard stop if we have already tried multiple self-healing passes.
+    if state["attempt_count"] >= 3 or feedback_loops >= 3:
+        print("\n🏁 Routing to END (MAX RETRIES REACHED)")  # This print signals that the self-healing loop has exhausted its budget.
         return "end"
-    elif state["attempt_count"] >= 3:
-        print("\n→ Routing to END (MAX RETRIES REACHED)")
-        return "end"
-    else:
-        print("\n→ Routing back to MODERNIZER (FAILED, RETRYING)")
+
+    if not verification_success:
+        # Compiler failure: route back to the modernizer with raw_stderr in error_log.
+        state["feedback_loop_count"] = feedback_loops + 1  # This line increments the feedback loop counter for a compiler failure retry.
+        print("\n🔄 Routing back to MODERNIZER (compiler failure, retrying)")  # This print explains that we are retrying due to compilation errors.
         return "modernizer"
+
+    if not parity_passed:
+        # Logic / parity failure: route back to the modernizer with unified_diff feedback.
+        state["feedback_loop_count"] = feedback_loops + 1  # This line increments the feedback loop counter for a parity failure retry.
+        print("\n🔄 Routing back to MODERNIZER (parity failure, self-healing)")  # This print explains that we are retrying due to a parity mismatch.
+        return "modernizer"
+
+    print("\n🏁 Routing to END (SUCCESS: compilation + parity)")  # This print signals that both compilation and parity passed.
+    return "end"
 
 
 def build_workflow():
@@ -305,16 +566,20 @@ def build_workflow():
     
     # Add nodes
     workflow.add_node("analyzer", analyzer_node)
+    workflow.add_node("pruner", pruner_node)
     workflow.add_node("modernizer", modernizer_node)
     workflow.add_node("verifier", verifier_node)
+    workflow.add_node("tester", tester_node)
     
-    # Define edges
-    workflow.add_edge("analyzer", "modernizer")
+    # Define edges for the graph-first, self-healing pipeline
+    workflow.add_edge("analyzer", "pruner")
+    workflow.add_edge("pruner", "modernizer")
     workflow.add_edge("modernizer", "verifier")
+    workflow.add_edge("verifier", "tester")
     
-    # Conditional edge from verifier based on result
+    # Conditional edge from tester based on compilation and parity results
     workflow.add_conditional_edges(
-        "verifier",
+        "tester",
         should_retry,
         {
             "modernizer": "modernizer",
@@ -341,10 +606,19 @@ def run_modernization_workflow(code: str, language: str = "python"):
         code=code,
         language=language,
         analysis="",
+        dependency_map={},
+        call_graph_data={},
+        impact_map={},
+        orphans=[],
+        analysis_report="",
         modernized_code="",
         verification_result={},
         error_log="",
-        attempt_count=0
+        attempt_count=0,
+        is_parity_passed=False,
+        is_functionally_equivalent=False,
+        diff_output="",
+        feedback_loop_count=0,
     )
     
     # Build and run the workflow
