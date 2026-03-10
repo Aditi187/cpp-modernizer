@@ -1,11 +1,49 @@
-int add(int a, int b) { // This function definition declares 'add' which takes two integers and will return their sum.
-    int c = a + b;      // This line creates a new integer 'c' and stores the result of adding 'a' and 'b'.
-    return c;           // This line returns the value of 'c' so that whoever called 'add' receives the sum.
-}                       // This closing brace marks the end of the 'add' function body.
+#include <iostream>
+#include <stdio.h>
 
-int main() {           // This function definition declares 'main', the special starting point of a C++ program.
-    int result = add(2, 3); // This line calls the 'add' function with 2 and 3, and stores the returned sum in 'result'.
-    return 0;               // This line tells the operating system that the program finished successfully with exit code 0.
-}                           // This closing brace marks the end of the 'main' function body.
+/**
+ * Legacy Discount Calculator
+ * This function is a leaf dependency.
+ */
+float applyDiscount(float price, float percent) {
+    return price * (1.0f - (percent / 100.0f));
+}
 
-// void fakefunc()
+/**
+ * Main Processing Logic
+ * Uses raw pointers and C-style iteration.
+ */
+void processOrders() {
+    int count = 3;
+    float* prices = new float[3]; // Manual allocation
+    prices[0] = 100.0;
+    prices[1] = 200.0;
+    prices[2] = 300.0;
+
+    printf("Processing %d items...\n", count);
+    
+    float total = 0;
+    for (int i = 0; i < count; i++) {
+        // Nested dependency call
+        float finalPrice = applyDiscount(prices[i], 10.0f);
+        total += finalPrice;
+    }
+
+    std::cout << "Total after 10% discount: " << total << std::endl;
+
+    delete[] prices; // Manual deallocation
+}
+
+/**
+ * ORPHAN FUNCTION
+ * This is never called by main or processOrders.
+ * The Pruner Node should remove this.
+ */
+void unusedLogic() {
+    std::cout << "This should be pruned!" << std::endl;
+}
+
+int main() {
+    processOrders();
+    return 0;
+}

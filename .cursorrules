@@ -1,7 +1,0 @@
-I am a non-coder building an Air-Gapped Code Modernization Engine.
-Project Goal: Automatically rewrite legacy C++/Java code into modern standards.
-Architecture Rules: > 
-1. Use LangGraph for all multi-step logic.
-2. Use FastMCP for all file-reading and compiler-running tools.
-3. Every line of code you write must have a plain-English comment.
-4. Prioritize Security (no internet calls) and Functional Parity (the code must do the same thing as before).

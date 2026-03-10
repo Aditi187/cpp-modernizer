@@ -1,175 +1,224 @@
+
 """
-Graph utilities for the Code Modernization Engine.  # This line explains that this file holds helpers for building and analyzing call graphs.
+Graph utilities for the Code Modernization Engine.
 
-We use networkx to represent the relationships between functions in a translation
-unit (which functions call which). This lets higher-level nodes reason about:
-  - orphan functions (no callers),
-  - circular recursions / cycles,
-  - and a compact "knowledge graph" view of the local code structure.
-"""  # This closing triple quote ends the human-readable description of this module.
-
-from __future__ import annotations  # This import allows postponed evaluation of type annotations.
-
-from typing import Any, Dict, List, Tuple  # This import lets us describe dictionaries and lists in type hints.
-
-import networkx as nx  # This import brings in networkx, which we use to build directed graphs.
+This module provides tools for building and analyzing function call graphs using networkx.
+"""
 
 
-def build_dependency_graph(  # This function constructs a directed graph from the parsed function metadata.
-    functions_info: List[Dict[str, Any]],
+from __future__ import annotations
+from typing import Any, Dict, List, Tuple
+import networkx as nx
+import logging
+
+
+
+def build_dependency_graph(
+    functions_info: List[Dict[str, Any]]
 ) -> Tuple[nx.DiGraph, Dict[str, List[str]]]:
     """
-    Build a directed call graph (DependencyGraph) from the list of per-function metadata.  # This docstring explains what this helper produces.
+    Builds a directed call graph from a list of function metadata.
 
-    Each function definition becomes a node. For every call "f -> g" discovered by the
-    parser, we add a directed edge from f (caller) to g (callee).
+    The implementation takes care to avoid adding duplicate edges and to
+    ignore self-referential calls, which can arise when the parser includes a
+    call expression inside the same function definition.
 
-    Returns a tuple of:
-      - graph: a networkx.DiGraph instance.
-      - dependency_map: a plain dictionary mapping function name -> sorted unique list
-        of functions it calls (for easy JSON serialization and LLM prompts).
-    """  # This closing triple quote ends the docstring.
+    Args:
+        functions_info: List of dictionaries containing function metadata.
 
-    graph: nx.DiGraph = nx.DiGraph()  # This line creates an empty directed graph to hold the call relationships.
+    Returns:
+        Tuple containing:
+            - graph: networkx.DiGraph instance.
+            - dependency_map: Dictionary mapping function name to sorted unique list of functions it calls.
+    """
+    graph: nx.DiGraph = nx.DiGraph()
+    defined_function_names: List[str] = []
+    for function_metadata in functions_info:
+        function_name = str(function_metadata.get("name") or "")
+        if not function_name:
+            continue
+        if function_name not in graph:
+            graph.add_node(function_name)
+        defined_function_names.append(function_name)
 
-    defined_function_names = []  # This list will record the names of all functions with definitions in this translation unit.
+    for function_metadata in functions_info:
+        caller_name = str(function_metadata.get("name") or "")
+        if not caller_name:
+            continue
+        called_functions = function_metadata.get("calls") or []
+        # use a set to dedupe and avoid self edges
+        seen: set[str] = set()
+        for callee in called_functions:
+            callee_name = str(callee or "")
+            if not callee_name or callee_name == caller_name:
+                # ignore empty names and self-recursion
+                continue
+            if callee_name in seen:
+                continue
+            seen.add(callee_name)
+            if callee_name not in graph:
+                graph.add_node(callee_name)
+            graph.add_edge(caller_name, callee_name)
 
-    for fn in functions_info:  # This loop processes each function metadata entry.
-        name = str(fn.get("name") or "")  # This line normalizes the function name as a string.
-        if not name:
-            continue  # This line skips anonymous or malformed entries.
-        if name not in graph:  # This condition ensures each defined function appears as a node.
-            graph.add_node(name)  # This line adds a node for the function in the graph.
-        defined_function_names.append(name)  # This line records that this function is defined here.
-
-    for fn in functions_info:  # This loop adds edges based on the "calls" lists.
-        caller = str(fn.get("name") or "")  # This line reads the caller function name.
-        if not caller:
-            continue  # This line skips entries without a usable name.
-        raw_calls = fn.get("calls") or []  # This line reads the raw list of callees reported by the parser.
-        for callee in raw_calls:  # This loop processes each callee name.
-            callee_name = str(callee or "")  # This line normalizes the callee name as a string.
-            if not callee_name:
-                continue  # This line skips empty names.
-            if callee_name not in graph:  # This condition ensures that the callee also appears as a node in the graph.
-                graph.add_node(callee_name)  # This line adds a node for the callee (even if it is external to this translation unit).
-            graph.add_edge(caller, callee_name)  # This line adds a directed edge from caller to callee.
-
-    dependency_map: Dict[str, List[str]] = {}  # This dictionary will hold a stable, sorted adjacency list per function.
-    for fn_name in defined_function_names:  # This loop builds a clean dependency list only for functions defined in this translation unit.
-        neighbors = sorted({str(n) for n in graph.successors(fn_name)})  # This line collects and sorts all direct callees of fn_name.
-        dependency_map[fn_name] = neighbors  # This line records the adjacency list for fn_name.
-
-    return graph, dependency_map  # This line returns both the graph and the dependency_map.
+    dependency_map: Dict[str, List[str]] = {}
+    for function_name in defined_function_names:
+        neighbors = sorted({str(neighbor) for neighbor in graph.successors(function_name)})
+        dependency_map[function_name] = neighbors
+    return graph, dependency_map
 
 
-def analyze_dependency_graph(  # This function analyzes the call graph to find orphans and cycles.
+
+def analyze_dependency_graph(
     graph: nx.DiGraph,
-    defined_function_names: List[str],
+    defined_function_names: List[str]
 ) -> Dict[str, Any]:
     """
-    Analyze a directed call graph to identify:  # This docstring explains what structural properties we compute.
-      - orphan functions: defined functions that have no callers.
-      - cycles: lists of function names that participate in circular recursion.
-    """  # This closing triple quote ends the docstring.
+    Analyzes a directed call graph to identify orphan functions and cycles.
 
-    # Orphans: functions that are defined in this translation unit and have no
-    # incoming edges (no callers). We intentionally do not special-case "main"
-    # here; higher-level nodes can decide whether to prune it.
-    orphans: List[str] = []  # This list will hold the names of functions with no callers.
-    for fn_name in defined_function_names:  # This loop inspects each defined function.
-        if graph.in_degree(fn_name) == 0:  # This condition checks whether any other function calls fn_name.
-            orphans.append(fn_name)  # This line records fn_name as an orphan.
+    Args:
+        graph: networkx.DiGraph instance representing the call graph.
+        defined_function_names: List of function names defined in the translation unit.
 
-    # Cycles: networkx.simple_cycles returns a list of cycles, where each cycle is
-    # a list of node names forming a directed loop.
-    cycles: List[List[str]] = []  # This list will hold each simple cycle found in the graph.
-    for cycle in nx.simple_cycles(graph):  # This loop iterates over all simple cycles in the graph.
-        as_strings = [str(name) for name in cycle]  # This line normalizes node names as strings.
-        cycles.append(as_strings)  # This line records the cycle.
-
-    return {  # This dictionary summarizes the structural properties we discovered.
+    Returns:
+        Dictionary with keys:
+            - "orphans": Sorted list of orphan function names.
+            - "cycles": List of cycles (each cycle is a list of function names).
+    """
+    orphans: List[str] = []
+    for function_name in defined_function_names:
+        if graph.in_degree(function_name) == 0:
+            orphans.append(function_name)
+    cycles: List[List[str]] = []
+    for cycle in nx.simple_cycles(graph):
+        cycle_names = [str(name) for name in cycle]
+        cycles.append(cycle_names)
+    return {
         "orphans": sorted(orphans),
         "cycles": cycles,
     }
 
 
-def build_analysis_report(  # This function builds a human-readable summary of the local code graph.
+
+def build_analysis_report(
     functions_info: List[Dict[str, Any]],
     dependency_map: Dict[str, List[str]],
     orphans: List[str],
-    cycles: List[List[str]],
+    cycles: List[List[str]]
 ) -> str:
     """
-    Build a concise, human-readable summary of the code structure in this translation unit.  # This docstring explains that the result is intended for logging and LLM context.
-    """  # This closing triple quote ends the docstring.
+    Builds a concise, human-readable summary of the code structure in the translation unit.
 
-    total_functions = len(functions_info)  # This line counts how many function definitions we have.
-    lines: List[str] = []  # This list will accumulate lines of the report.
+    Args:
+        functions_info: List of function metadata dictionaries.
+        dependency_map: Dictionary mapping function name to list of callees.
+        orphans: List of orphan function names.
+        cycles: List of cycles (each cycle is a list of function names).
 
-    lines.append(f"Total functions: {total_functions}")  # This line records the function count.
-    lines.append(f"Orphan functions (no callers): {', '.join(sorted(orphans)) or 'none'}")  # This line records the orphan set.
-
-    if cycles:  # This condition checks whether any cycles were discovered.
-        formatted_cycles = [" -> ".join(cycle) for cycle in cycles]  # This line formats each cycle as a simple arrow chain.
-        lines.append("Circular recursion / cycles:")  # This line introduces the cycle section.
-        for cycle_str in formatted_cycles:  # This loop adds one line per cycle.
+    Returns:
+        Multi-line string summary.
+    """
+    total_functions = len(functions_info)
+    lines: List[str] = []
+    lines.append(f"Total functions: {total_functions}")
+    lines.append(f"Orphan functions (no callers): {', '.join(sorted(orphans)) or 'none'}")
+    if cycles:
+        formatted_cycles = [" -> ".join(cycle) for cycle in cycles]
+        lines.append("Circular recursion / cycles:")
+        for cycle_str in formatted_cycles:
             lines.append(f"  - {cycle_str}")
     else:
-        lines.append("Circular recursion / cycles: none")  # This line records that no cycles were found.
-
-    # Optionally add a short per-function summary so the model sees the local neighborhood for each function.
-    lines.append("Per-function call summary:")  # This line introduces the per-function section.
-    for fn_name in sorted(dependency_map.keys()):  # This loop summarizes each function's outgoing edges.
-        callees = dependency_map.get(fn_name, [])
-        lines.append(f"  - {fn_name} calls [{', '.join(callees) or 'none'}]")  # This line records the callees for fn_name.
-
-    return "\n".join(lines)  # This line joins all lines into a single multi-line string report.
+        lines.append("Circular recursion / cycles: none")
+    lines.append("Per-function call summary:")
+    for function_name in sorted(dependency_map.keys()):
+        callees = dependency_map.get(function_name, [])
+        lines.append(f"  - {function_name} calls [{', '.join(callees) or 'none'}]")
+    return "\n".join(lines)
 
 
-class DependencyGraph:  # This lightweight wrapper class provides an explicit DependencyGraph abstraction for callers.
+
+class DependencyGraph:
     """
-    Object-oriented wrapper around the call graph utilities above.  # This docstring explains that this class encapsulates a networkx.DiGraph.
+    Wrapper class for function call graph utilities.
 
-    It:
-      - builds a directed call graph from a list of per-function metadata,
-      - exposes a dependency_map adjacency list (function -> callees),
-      - can analyze the graph for orphans and cycles,
-      - and can export a simple nodes/edges dict for visualization or prompts.
-    """  # This closing triple quote ends the docstring.
-
-    def __init__(self, functions_info: List[Dict[str, Any]]) -> None:  # This initializer builds the underlying graph from function metadata.
+    Builds a directed call graph from function metadata, exposes dependency map,
+    analyzes for orphans and cycles, and exports nodes/edges for visualization.
+    """
+    def __init__(self, functions_info: List[Dict[str, Any]]) -> None:
         """
-        Construct a DependencyGraph from a list of function metadata dictionaries.  # This docstring explains the constructor input.
-        """
+        Initializes DependencyGraph from a list of function metadata dictionaries.
 
-        graph, dependency_map = build_dependency_graph(functions_info)  # This line delegates to the functional helper to build the graph and adjacency list.
-        self.graph: nx.DiGraph = graph  # This attribute stores the underlying networkx directed graph.
-        self.dependency_map: Dict[str, List[str]] = dependency_map  # This attribute stores the caller -> callees adjacency list.
-        self.defined_function_names: List[str] = [  # This attribute records the names of all functions with definitions.
-            str(fn.get("name") or "")
-            for fn in functions_info
-            if fn.get("name")
+        The constructor builds the internal directed graph and a lightweight
+        dependency map.  It also records the set of names that were *defined*
+        in this translation unit.  Note that "main" (or any other entry-point
+        function) will appear just like an orphan because it has no callers, but
+        the distinction between a genuine orphan and the entry point is left to
+        callers of ``analyze`` (see below).
+
+        Args:
+            functions_info: List of function metadata dictionaries.
+        """
+        graph, dependency_map = build_dependency_graph(functions_info)
+        self.graph: nx.DiGraph = graph
+        self.dependency_map: Dict[str, List[str]] = dependency_map
+        self.defined_function_names: List[str] = [
+            str(function_metadata.get("name") or "")
+            for function_metadata in functions_info
+            if function_metadata.get("name")
         ]
 
-    def analyze(self) -> Dict[str, Any]:  # This method analyzes the graph to find orphans and cycles.
+    def analyze(self) -> Dict[str, Any]:
         """
-        Analyze the graph and return the same structure as analyze_dependency_graph.  # This docstring explains that this method is a thin wrapper.
-        """
+        Analyzes the graph for orphans and cycles.
 
-        return analyze_dependency_graph(self.graph, self.defined_function_names)  # This line delegates to the existing helper.
+        Logical orphans are defined as functions that have no incoming edges in
+        the call graph.  A program entry point such as ``main`` will also show up
+        in this list, because by definition nobody calls it.  The calling code
+        (e.g. the workflow or test harness) is responsible for treating ``main``
+        specially if desired.  For example, the pruner node in the workflow
+        explicitly filters out ``main`` when removing orphan functions.
 
-    def to_dict(self) -> Dict[str, Any]:  # This method exports the graph as simple nodes/edges data.
+        Returns:
+            Dictionary with keys "orphans" and "cycles".
         """
-        Export the call graph as a JSON-serializable dictionary with:
-          - "nodes": list of function names
-          - "edges": list of {"from": caller, "to": callee} dictionaries.  # This docstring explains the output shape.
+        return analyze_dependency_graph(self.graph, self.defined_function_names)
+    def to_dict(self) -> Dict[str, Any]:
         """
+        Exports the call graph as a JSON-serializable dictionary.
 
-        nodes = [str(node) for node in self.graph.nodes]  # This line collects all node names as strings.
-        edges = [  # This list comprehension builds a list of edge dictionaries.
-            {"from": str(u), "to": str(v)}
-            for u, v in self.graph.edges
+        Returns:
+            Dictionary with "nodes" (list of function names) and "edges" (list of caller/callee dicts).
+        """
+        nodes = [str(node) for node in self.graph.nodes]
+        edges = [
+            {"from": str(caller), "to": str(callee)}
+            for caller, callee in self.graph.edges
         ]
-        return {"nodes": nodes, "edges": edges}  # This line returns the combined structure.
+        return {"nodes": nodes, "edges": edges}
+
+    def get_impact_radius(self, function_name: str) -> int:
+        """
+        Calculate how many distinct functions are downstream of the given
+        function, either directly or transitively.
+
+        This provides a simple measure of the "impact radius" – how many other
+        functions could be affected if `function_name` were changed.
+
+        Args:
+            function_name: Name of the function to inspect.
+
+        Returns:
+            int: Number of unique functions reachable from `function_name`.
+        """
+        if function_name not in self.graph:
+            return 0
+        visited: set[str] = set()
+        stack = [function_name]
+        while stack:
+            current = stack.pop()
+            for succ in self.graph.successors(current):
+                succ_name = str(succ)
+                if succ_name not in visited:
+                    visited.add(succ_name)
+                    stack.append(succ_name)
+        return len(visited)
         

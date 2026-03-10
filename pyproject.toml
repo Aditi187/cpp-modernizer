@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "air-gapped-codebase-modernization-engine"
+version = "0.1.0"
+description = "A tool for modernizing codebases in air-gapped environments"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    # Add your dependencies here, e.g.:
+    # "langgraph",
+    # "tree-sitter",
+    # Add from requirements.txt
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "flake8",
+]
+
+[project.scripts]
+# If you have a main entry point, e.g.:
+# modernization-engine = "core.main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agents*", "core*", "tools*"]
+exclude = ["tests*", "scripts*", "outputs*"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
