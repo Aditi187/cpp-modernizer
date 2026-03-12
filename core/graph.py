@@ -1,40 +1,192 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import hashlib
+from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 
 
+# ---------------------------------------------------------------------------
+# Polymorphism helpers
+# ---------------------------------------------------------------------------
+
+def _compute_signature_hash(parameters: List[Dict[str, Any]]) -> str:
+    """Return a short deterministic hash of a function's parameter types.
+
+    Used to distinguish overloaded functions that share the same simple name.
+    """
+    type_str = ",".join(str(p.get("type") or "") for p in parameters)
+    return hashlib.md5(type_str.encode("utf-8")).hexdigest()[:8]
+
+
+def _build_class_hierarchy(
+    types_info: List[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """Return a mapping of class/struct name → list of direct base class names."""
+    hierarchy: Dict[str, List[str]] = {}
+    for t in types_info:
+        if t.get("type") in {"class", "struct"}:
+            name = str(t.get("name") or "")
+            if name:
+                hierarchy[name] = [str(b) for b in (t.get("bases") or [])]
+    return hierarchy
+
+
+def _get_ancestors(
+    class_name: str,
+    hierarchy: Dict[str, List[str]],
+) -> List[str]:
+    """BFS walk up the inheritance graph and return all ancestor class names."""
+    result: List[str] = []
+    visited: set[str] = set()
+    queue: List[str] = list(hierarchy.get(class_name, []))
+    while queue:
+        base = queue.pop(0)
+        if base in visited:
+            continue
+        visited.add(base)
+        result.append(base)
+        queue.extend(hierarchy.get(base, []))
+    return result
+
+
+def _resolve_virtual_call_targets(
+    method_name: str,
+    caller_class: str,
+    class_hierarchy: Dict[str, List[str]],
+    method_to_fqns: Dict[str, List[str]],
+) -> List[str]:
+    """Resolve a virtual/polymorphic method call to a list of candidate FQNs.
+
+    Resolution order:
+    1. Exact match in the caller's own class (``caller_class::method_name``).
+    2. Walk up the inheritance hierarchy to find the first ancestor that
+       implements the method.
+    3. If the caller class is unknown or not in the hierarchy, return all FQNs
+       that define a method with that simple name (conservative over-approximation).
+
+    Returns an empty list when *method_name* is not defined anywhere in the file
+    (i.e., it is an external call).
+    """
+    candidates = method_to_fqns.get(method_name, [])
+    if not candidates:
+        return []  # External — let the caller handle it.
+
+    if caller_class:
+        exact = f"{caller_class}::{method_name}"
+        if exact in candidates:
+            return [exact]
+        # Walk up the hierarchy to find an inherited implementation.
+        for ancestor in _get_ancestors(caller_class, class_hierarchy):
+            inherited = f"{ancestor}::{method_name}"
+            if inherited in candidates:
+                return [inherited]
+
+    # Free-function context or no match found in hierarchy: be conservative.
+    return candidates
+
+
 def build_dependency_graph(
     functions_info: List[Dict[str, Any]],
+    types_info: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[nx.DiGraph, Dict[str, List[str]], Dict[str, bool], List[str]]:
     graph: nx.DiGraph = nx.DiGraph()
     is_defined_in_file: Dict[str, bool] = {}
     defined_function_names: List[str] = []
 
+    class_hierarchy = _build_class_hierarchy(types_info or [])
+
+    # Build an index: simple method name → all FQNs in this file that define it.
+    # Used for virtual/inherited call resolution.
+    method_to_fqns: Dict[str, List[str]] = {}
+    for fn in functions_info:
+        fqn = str(fn.get("fqn") or fn.get("name") or "")
+        simple = str(fn.get("name") or "")
+        if simple and fqn:
+            method_to_fqns.setdefault(simple, []).append(fqn)
+
+    # Pass 1: add every defined function as a graph node with attributes.
     for fn in functions_info:
         name = str(fn.get("name") or "")
         if not name:
             continue
+        parameters = fn.get("parameters") or []
+        sig_hash = _compute_signature_hash(parameters)
+        modifiers = fn.get("modifiers") or []
+        is_virtual = "virtual" in modifiers
         if name not in graph:
-            graph.add_node(name)
+            graph.add_node(name, signature_hash=sig_hash, is_virtual=is_virtual)
+        else:
+            graph.nodes[name]["signature_hash"] = sig_hash
+            graph.nodes[name]["is_virtual"] = is_virtual
         is_defined_in_file[name] = True
         defined_function_names.append(name)
 
+    # Pass 2: add call edges, using call_details for polymorphic resolution.
     for fn in functions_info:
         caller = str(fn.get("name") or "")
         if not caller:
             continue
-        raw_calls = fn.get("calls") or []
-        for callee in raw_calls:
-            callee_name = str(callee or "")
-            if not callee_name:
-                continue
-            if callee_name not in graph:
-                graph.add_node(callee_name)
-            if callee_name not in is_defined_in_file:
-                is_defined_in_file[callee_name] = False
-            graph.add_edge(caller, callee_name)
+
+        # Derive the class scope of this caller from its FQN so we can walk the
+        # inheritance graph when resolving virtual method calls.
+        caller_fqn = str(fn.get("fqn") or caller)
+        fqn_parts = caller_fqn.split("::")
+        caller_class = fqn_parts[-2] if len(fqn_parts) >= 2 else ""
+
+        call_details = fn.get("call_details") or []
+        if call_details:
+            for detail in call_details:
+                if not isinstance(detail, dict):
+                    continue
+                kind = str(detail.get("kind") or "")
+                call_name = str(detail.get("name") or "")
+                call_display = str(detail.get("display") or call_name)
+                if not call_name:
+                    continue
+
+                if kind == "method":
+                    # Use inheritance-aware resolution for virtual/polymorphic calls.
+                    resolved_fqns = _resolve_virtual_call_targets(
+                        call_name, caller_class, class_hierarchy, method_to_fqns
+                    )
+                    if resolved_fqns:
+                        for target_fqn in resolved_fqns:
+                            target_node = target_fqn.split("::")[-1]
+                            if target_node not in graph:
+                                graph.add_node(target_node)
+                            if target_node not in is_defined_in_file:
+                                is_defined_in_file[target_node] = False
+                            graph.add_edge(caller, target_node)
+                    else:
+                        # External method call — record with display name.
+                        if call_display not in graph:
+                            graph.add_node(call_display)
+                        if call_display not in is_defined_in_file:
+                            is_defined_in_file[call_display] = False
+                        graph.add_edge(caller, call_display)
+                else:
+                    # Local or scoped call.
+                    callee_name = call_display if "::" in call_display else call_name
+                    if not callee_name:
+                        continue
+                    if callee_name not in graph:
+                        graph.add_node(callee_name)
+                    if callee_name not in is_defined_in_file:
+                        is_defined_in_file[callee_name] = False
+                    graph.add_edge(caller, callee_name)
+        else:
+            # Legacy path: functions_info without call_details (simple calls list).
+            raw_calls = fn.get("calls") or []
+            for callee in raw_calls:
+                callee_name = str(callee or "")
+                if not callee_name:
+                    continue
+                if callee_name not in graph:
+                    graph.add_node(callee_name)
+                if callee_name not in is_defined_in_file:
+                    is_defined_in_file[callee_name] = False
+                graph.add_edge(caller, callee_name)
 
     dependency_map: Dict[str, List[str]] = {}
     for fn_name in defined_function_names:
@@ -103,13 +255,17 @@ def build_analysis_report(
 
 
 class DependencyGraph:
-    def __init__(self, functions_info: List[Dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        functions_info: List[Dict[str, Any]],
+        types_info: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         (
             graph,
             dependency_map,
             is_defined_in_file,
             defined_function_names,
-        ) = build_dependency_graph(functions_info)
+        ) = build_dependency_graph(functions_info, types_info=types_info)
         self.graph: nx.DiGraph = graph
         self._dependency_map: Dict[str, List[str]] = dependency_map
         self.is_defined_in_file: Dict[str, bool] = is_defined_in_file
@@ -185,6 +341,7 @@ class DependencyGraph:
         nodes: List[Dict[str, Any]] = []
         for node in self.graph.nodes:
             name = str(node)
+            attrs = self.graph.nodes[name]
             nodes.append(
                 {
                     "name": name,
@@ -194,6 +351,8 @@ class DependencyGraph:
                     "criticality_score": float(
                         self._criticality_scores.get(name, 0.0)
                     ),
+                    "signature_hash": str(attrs.get("signature_hash") or ""),
+                    "is_virtual": bool(attrs.get("is_virtual", False)),
                 }
             )
 

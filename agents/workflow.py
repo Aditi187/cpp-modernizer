@@ -8,12 +8,11 @@ import os as os_module
 sys.path.insert(0, os_module.path.dirname(os_module.path.dirname(os_module.path.abspath(__file__))))
 
 from langgraph.graph import StateGraph, END
-from typing import TypedDict, Any
+from typing import TypedDict, Any, Optional
 import json
 import os
 import re
 import tempfile
-import time
 import requests
 
 from langchain_ollama import ChatOllama
@@ -48,6 +47,273 @@ def check_ollama_health() -> bool:
         return False  # This return ensures the script does not continue without a working Ollama server.
 
 
+def _parse_functions_from_source(source_code: str) -> list[dict[str, Any]]:
+    """Parse C++ source from text and return function metadata."""
+
+    temp_file_path: Optional[str] = None
+    try:
+        temp_file = tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".cpp",
+            mode="w",
+            encoding="utf-8",
+        )
+        temp_file_path = temp_file.name
+        temp_file.write(source_code)
+        temp_file.flush()
+        temp_file.close()
+        return extract_functions_from_cpp_file(temp_file_path)
+    except Exception:
+        return []
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+def _build_callers_map(dependency_map: dict[str, list[str]]) -> dict[str, list[str]]:
+    callers_map: dict[str, list[str]] = {name: [] for name in dependency_map.keys()}
+    for caller_name, callees in dependency_map.items():
+        for callee_name in callees:
+            if callee_name in callers_map and caller_name not in callers_map[callee_name]:
+                callers_map[callee_name].append(caller_name)
+    return callers_map
+
+
+def _clean_model_code_block(text: str) -> str:
+    cleaned = re.sub(r"```(?:[^\n]*)\n?", "", text)
+    return cleaned.strip()
+
+
+def _extract_error_line_numbers(compiler_text: str) -> list[int]:
+    """Extract likely source line numbers from compiler stderr/stdout text."""
+
+    line_numbers: set[int] = set()
+    for match in re.finditer(r":(\d+):(\d+)?:", compiler_text):
+        try:
+            line_numbers.add(int(match.group(1)))
+        except ValueError:
+            continue
+    return sorted(line_numbers)
+
+
+def _get_code_snippet_by_line(code_text: str, line_number: int, radius: int = 2) -> str:
+    lines = code_text.splitlines()
+    if line_number <= 0 or line_number > len(lines):
+        return ""
+
+    start = max(1, line_number - radius)
+    end = min(len(lines), line_number + radius)
+    snippet_lines: list[str] = []
+    for idx in range(start, end + 1):
+        snippet_lines.append(f"{idx:4d}: {lines[idx - 1]}")
+    return "\n".join(snippet_lines)
+
+
+def _replace_function_by_span(
+    source_code: str,
+    start_byte: int,
+    end_byte: int,
+    replacement: str,
+) -> str:
+    source_bytes = source_code.encode("utf-8")
+    prefix = source_bytes[:start_byte]
+    suffix = source_bytes[end_byte:]
+    replacement_bytes = replacement.encode("utf-8")
+    updated_bytes = prefix + replacement_bytes + suffix
+    return updated_bytes.decode("utf-8", errors="replace")
+
+
+def _extract_function_text_from_code(source_code: str, function_name: str) -> str:
+    functions_info = _parse_functions_from_source(source_code)
+    for function_info in functions_info:
+        if str(function_info.get("name") or "") != function_name:
+            continue
+        start_byte = function_info.get("start_byte")
+        end_byte = function_info.get("end_byte")
+        if isinstance(start_byte, int) and isinstance(end_byte, int):
+            code_bytes = source_code.encode("utf-8")
+            return code_bytes[start_byte:end_byte].decode("utf-8", errors="replace")
+    return ""
+
+
+class IncludeManager:
+    """Maps modern C++ feature patterns to the headers they require and injects
+    missing ``#include`` directives into source files.
+
+    Usage::
+
+        manager = IncludeManager()
+        updated_file = manager.update_file_includes(full_file_content, new_function_code)
+    """
+
+    # (regex_pattern, header) — each pattern is tested independently so one
+    # header can be triggered by multiple patterns (e.g. both std::variant and
+    # std::visit map to <variant>).
+    _FEATURE_HEADERS: list[tuple[str, str]] = [
+        # C++23
+        (r"\bstd::print\b",                "<print>"),
+        (r"\bstd::println\b",              "<print>"),
+        # C++20 — formatting
+        (r"\bstd::format\b",               "<format>"),
+        (r"\bstd::vformat\b",              "<format>"),
+        # C++20 — ranges / views
+        (r"\bstd::ranges::",               "<ranges>"),
+        (r"\bstd::views::",                "<ranges>"),
+        # C++20 — span
+        (r"\bstd::span\b",                 "<span>"),
+        # C++20 — bit operations
+        (r"\bstd::popcount\b",             "<bit>"),
+        (r"\bstd::countl_zero\b",          "<bit>"),
+        (r"\bstd::bit_cast\b",             "<bit>"),
+        # C++20 — math constants
+        (r"\bstd::numbers::",              "<numbers>"),
+        # C++20 — concepts
+        (r"\bstd::integral\b",             "<concepts>"),
+        (r"\bstd::floating_point\b",       "<concepts>"),
+        (r"\bstd::same_as\b",              "<concepts>"),
+        (r"\bstd::convertible_to\b",       "<concepts>"),
+        (r"\bstd::invocable\b",            "<concepts>"),
+        # C++17 — string_view, optional, variant, any, filesystem, execution
+        (r"\bstd::string_view\b",          "<string_view>"),
+        (r"\bstd::optional\b",             "<optional>"),
+        (r"\bstd::variant\b",              "<variant>"),
+        (r"\bstd::visit\b",                "<variant>"),
+        (r"\bstd::any\b",                  "<any>"),
+        (r"\bstd::filesystem::",           "<filesystem>"),
+        (r"\bstd::execution::",            "<execution>"),
+        # Smart pointers / memory management
+        (r"\bstd::unique_ptr\b",           "<memory>"),
+        (r"\bstd::shared_ptr\b",           "<memory>"),
+        (r"\bstd::weak_ptr\b",             "<memory>"),
+        (r"\bstd::make_unique\b",          "<memory>"),
+        (r"\bstd::make_shared\b",          "<memory>"),
+        # Containers
+        (r"\bstd::vector\b",               "<vector>"),
+        (r"\bstd::array\b",                "<array>"),
+        (r"\bstd::map\b",                  "<map>"),
+        (r"\bstd::unordered_map\b",        "<unordered_map>"),
+        (r"\bstd::set\b",                  "<set>"),
+        (r"\bstd::unordered_set\b",        "<unordered_set>"),
+        (r"\bstd::deque\b",                "<deque>"),
+        (r"\bstd::list\b",                 "<list>"),
+        (r"\bstd::forward_list\b",         "<forward_list>"),
+        (r"\bstd::stack\b",                "<stack>"),
+        (r"\bstd::queue\b",                "<queue>"),
+        (r"\bstd::priority_queue\b",       "<queue>"),
+        # Strings / streams
+        (r"\bstd::string\b",               "<string>"),
+        (r"\bstd::stringstream\b",         "<sstream>"),
+        (r"\bstd::ostringstream\b",        "<sstream>"),
+        (r"\bstd::istringstream\b",        "<sstream>"),
+        # I/O
+        (r"\bstd::cout\b",                 "<iostream>"),
+        (r"\bstd::cin\b",                  "<iostream>"),
+        (r"\bstd::cerr\b",                 "<iostream>"),
+        # Algorithms
+        (r"\bstd::sort\b",                 "<algorithm>"),
+        (r"\bstd::find\b",                 "<algorithm>"),
+        (r"\bstd::transform\b",            "<algorithm>"),
+        (r"\bstd::for_each\b",             "<algorithm>"),
+        (r"\bstd::copy\b",                 "<algorithm>"),
+        (r"\bstd::fill\b",                 "<algorithm>"),
+        (r"\bstd::count_if\b",             "<algorithm>"),
+        # Numeric
+        (r"\bstd::accumulate\b",           "<numeric>"),
+        (r"\bstd::iota\b",                 "<numeric>"),
+        (r"\bstd::reduce\b",               "<numeric>"),
+        # Utility
+        (r"\bstd::move\b",                 "<utility>"),
+        (r"\bstd::forward\b",              "<utility>"),
+        (r"\bstd::pair\b",                 "<utility>"),
+        (r"\bstd::swap\b",                 "<utility>"),
+        (r"\bstd::exchange\b",             "<utility>"),
+        # Tuple
+        (r"\bstd::tuple\b",                "<tuple>"),
+        (r"\bstd::tie\b",                  "<tuple>"),
+        # Concurrency
+        (r"\bstd::thread\b",               "<thread>"),
+        (r"\bstd::mutex\b",                "<mutex>"),
+        (r"\bstd::lock_guard\b",           "<mutex>"),
+        (r"\bstd::unique_lock\b",          "<mutex>"),
+        (r"\bstd::condition_variable\b",   "<condition_variable>"),
+        (r"\bstd::atomic\b",               "<atomic>"),
+        (r"\bstd::chrono::",               "<chrono>"),
+        # Functional
+        (r"\bstd::function\b",             "<functional>"),
+        (r"\bstd::bind\b",                 "<functional>"),
+        # Exceptions
+        (r"\bstd::exception\b",            "<exception>"),
+        (r"\bstd::runtime_error\b",        "<stdexcept>"),
+        (r"\bstd::logic_error\b",          "<stdexcept>"),
+        (r"\bstd::out_of_range\b",         "<stdexcept>"),
+        (r"\bstd::invalid_argument\b",     "<stdexcept>"),
+        # Type traits
+        (r"\bstd::is_same\b",              "<type_traits>"),
+        (r"\bstd::is_same_v\b",            "<type_traits>"),
+        (r"\bstd::enable_if\b",            "<type_traits>"),
+        (r"\bstd::decay\b",                "<type_traits>"),
+        (r"\bstd::decay_t\b",              "<type_traits>"),
+        (r"\bstd::remove_reference\b",     "<type_traits>"),
+        # Numeric limits
+        (r"\bstd::numeric_limits\b",       "<limits>"),
+    ]
+
+    def _get_existing_includes(self, file_content: str) -> set[str]:
+        """Return the set of header strings already present in file_content."""
+        return {
+            m.group(1).strip()
+            for m in re.finditer(
+                r'^\s*#\s*include\s*([<"][^>"]+[>"])',
+                file_content,
+                re.MULTILINE,
+            )
+        }
+
+    def required_headers(self, code: str) -> set[str]:
+        """Return the set of headers required by feature patterns found in code."""
+        needed: set[str] = set()
+        for pattern, header in self._FEATURE_HEADERS:
+            if re.search(pattern, code):
+                needed.add(header)
+        return needed
+
+    def update_file_includes(self, file_content: str, modernized_code: str) -> str:
+        """Return file_content with missing headers injected after the last #include.
+
+        Scans *modernized_code* for known C++ feature patterns to determine which
+        headers are needed.  Any header not already present in *file_content* is
+        injected right after the last existing ``#include`` line in alphabetical
+        order.  If no ``#include`` exists, the directives are prepended at the top.
+        """
+        existing = self._get_existing_includes(file_content)
+        needed = self.required_headers(modernized_code)
+        missing = needed - existing
+        if not missing:
+            return file_content
+
+        new_directives = sorted(f"#include {h}" for h in missing)
+        lines = file_content.splitlines()
+
+        # Locate the last #include within the first 100 lines (safe header-block limit).
+        last_include_idx = -1
+        scan_limit = min(len(lines), 100)
+        for i in range(scan_limit):
+            if lines[i].strip().startswith("#include"):
+                last_include_idx = i
+
+        if last_include_idx >= 0:
+            insert_at = last_include_idx + 1
+            result_lines = lines[:insert_at] + new_directives + lines[insert_at:]
+        else:
+            result_lines = new_directives + lines
+
+        # Preserve trailing newline if the original had one.
+        joined = "\n".join(result_lines)
+        if file_content.endswith("\n") and not joined.endswith("\n"):
+            joined += "\n"
+        return joined
+
+
 class ModernizationState(TypedDict):
     """State object passed through the workflow"""
     code: str  # This field holds either the raw source code text or a path to a source file, depending on how the workflow is invoked.
@@ -70,6 +336,8 @@ class ModernizationState(TypedDict):
     modernized_functions: dict[str, str]  # This field tracks which functions have already been modernized.
     current_function_index: int  # This field tracks which function in the modernization_order is currently being modernized.
     partial_success: bool  # This field records whether the workflow finished with only a subset of functions modernized.
+    last_working_code: str  # This field stores the last code snapshot that successfully compiled.
+    current_target_function: str  # This field stores the function being surgically modernized in the current iteration.
 
 
 def analyzer_node(state: ModernizationState) -> ModernizationState:
@@ -274,119 +542,110 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     if state["error_log"]:  # This condition checks whether the verifier or tester reported any previous issues.
         print(f"Previous Feedback:\n{state['error_log']}")  # This print shows that feedback so you can see what the model is being asked to fix.
 
-    # Decide which version of the code we want to improve: the last modernized version (if any) or the original legacy code.
-    source_to_improve = state["modernized_code"] or state["code"]  # This line prefers the most recent modernized code but falls back to the original code on the first attempt.
+    # Prefer the last known compiling snapshot as our base, then fall back.
+    source_to_improve = (
+        state.get("last_working_code")
+        or state["modernized_code"]
+        or state["code"]
+    )
 
     print(f"Source Code To Modernize (first 200 chars):\n{source_to_improve[:200]}...")  # This print shows the first part of the code that will be sent to the model.
 
     is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether we are working with C++ so we know whether to ask for C++20 modernization.
 
     modernized = source_to_improve  # This line initializes the modernized code to the source as a safe default in case the model call fails.
+    state["current_target_function"] = ""
 
     if is_cpp and ChatOllama is not None:  # This condition ensures we only call the local Ollama model when we have both C++ code and the library installed.
+        functions_info = _parse_functions_from_source(source_to_improve)
+        functions_by_name: dict[str, dict[str, Any]] = {
+            str(fn.get("name") or ""): fn for fn in functions_info if fn.get("name")
+        }
+
+        modernization_order = state.get("modernization_order") or list(functions_by_name.keys())
+        current_index = int(state.get("current_function_index", 0))
+
+        while current_index < len(modernization_order):
+            candidate = modernization_order[current_index]
+            if candidate in functions_by_name:
+                break
+            current_index += 1
+
+        if current_index >= len(modernization_order):
+            print("No remaining functions to modernize surgically; leaving code unchanged.")
+            state["attempt_count"] += 1
+            state["modernized_code"] = source_to_improve
+            return state
+
+        state["current_function_index"] = current_index
+        current_function_name = modernization_order[current_index]
+        state["current_target_function"] = current_function_name
+        current_function_info = functions_by_name[current_function_name]
+        current_function_source = _extract_function_text_from_code(source_to_improve, current_function_name)
+
+        callers_map = _build_callers_map(state.get("dependency_map", {}))
+        callers = sorted(callers_map.get(current_function_name, []))
+        callers_display = ", ".join(callers) if callers else "none"
+
         # Build a detailed natural-language prompt that explains the task and enforces strict C++20 rules for the deepseek-coder model.
         prompt_parts: list[str] = []  # This list will collect different sections of the prompt before joining them into a single string.
-        prompt_parts.append(  # This call adds the high-level instruction describing the assistant's role and strict syntax requirements.
+        prompt_parts.append(
             "You are a Master C++20 Developer. "
             "Never use JavaScript keywords like 'function'. "
             "Always use proper C++ syntax (for example: 'int main()', 'auto', 'void', correct return types, and semicolons). "
-            "Rewrite the given legacy C++ code into clean, idiomatic, and safe C++20 while preserving the original behavior."
-        )  # This comment explains that we clearly tell the model to avoid JavaScript-style code and stick to real C++20.
-        analysis_obj = None
+            "Perform a surgical refactor while preserving behavior."
+        )
+        prompt_parts.append(
+            f"Modernize only the function [{current_function_name}]. "
+            f"Keep the signature compatible with its callers: [{callers_display}]."
+        )
 
-        modernization_order = state.get("modernization_order") or list(state.get("dependency_map", {}).keys())
-        current_index = int(state.get("current_function_index", 0))
-        current_function_name = None
-        if modernization_order and 0 <= current_index < len(modernization_order):
-            current_function_name = modernization_order[current_index]
+        signature_text = str(current_function_info.get("signature") or "")
+        comments_text = str(current_function_info.get("comments") or "")
+        if signature_text:
+            prompt_parts.append(f"Current function signature:\n{signature_text}")
+        if comments_text:
+            prompt_parts.append(f"Current function comments:\n{comments_text}")
 
         already_modernized = state.get("modernized_functions") or {}
-        already_modernized_names = [
-            name
-            for name in modernization_order[:current_index]
-            if name in already_modernized
-        ]
-
-        if current_function_name is not None:
-            deps_str = ", ".join(already_modernized_names) if already_modernized_names else "none"
-            prompt_parts.append(
-                f"You are currently modernizing function '{current_function_name}'. "
-                f"We have already modernized its dependencies: [{deps_str}]. "
-                "Use the updated signatures of these functions while refactoring the current function."
-            )
-        if state["analysis"]:  # This condition checks whether the deep analyzer produced any structured information about functions.
-            prompt_parts.append(  # This call adds a section containing the analyzer's JSON output so the model can see function structure and dependencies.
-                "Here is a JSON analysis of the current code (functions, metadata, function dependency map, orphan functions, and cycles):\n"
-                f"{state['analysis']}"
-            )  # This comment clarifies that we are sharing a rich, graph-aware analysis with the model.
-            try:
-                analysis_obj = json.loads(state["analysis"])  # This line parses the analysis JSON so we can use function signatures and comments.
-            except json.JSONDecodeError:
-                analysis_obj = None  # This line safely falls back if the JSON cannot be parsed.
-        if state.get("dependency_map"):  # This condition checks whether we have a non-empty dependency map to share explicitly.
-            prompt_parts.append(  # This call adds a compact, focused view of the dependency map so the model can quickly see the local call graph.
-                "Here is a concise JSON function dependency map for this translation unit:\n"
-                f"{json.dumps(state['dependency_map'], indent=2, sort_keys=True)}"
-            )  # This comment clarifies that we provide a focused call graph optimized for the model's consumption.
-            # Derive caller information from the dependency_map so we can describe per-function context.
-            dep_map = state["dependency_map"]
-            callers_map: dict[str, list[str]] = {name: [] for name in dep_map.keys()}  # This dictionary will map each function to the list of functions that call it.
-            for caller_name, callees in dep_map.items():  # This loop inverts the adjacency list to build the callers map.
-                for callee_name in callees:
-                    if callee_name in callers_map and caller_name not in callers_map[callee_name]:
-                        callers_map[callee_name].append(caller_name)
-
-            per_function_context_lines: list[str] = []  # This list will hold human-readable context lines for each function.
-            signatures_by_name: dict[str, str] = {}
-            comments_by_name: dict[str, str] = {}
-            if isinstance(analysis_obj, dict):
-                for fn_info in analysis_obj.get("functions", []):  # This loop builds lookup tables for signatures and comments by function name.
-                    fn_name = str(fn_info.get("name") or "")
-                    if not fn_name:
-                        continue
-                    if "signature" in fn_info:
-                        signatures_by_name[fn_name] = str(fn_info.get("signature") or "")
-                    if "comments" in fn_info:
-                        comments_by_name[fn_name] = str(fn_info.get("comments") or "")
-
-            for fn_name in sorted(dep_map.keys()):  # This loop builds a context sentence for each function in the translation unit.
-                callers = sorted(callers_map.get(fn_name, []))
-                callees = dep_map.get(fn_name, [])
-                callers_str = ", ".join(callers) if callers else "none"
-                callees_str = ", ".join(callees) if callees else "none"
-                signature_text = signatures_by_name.get(fn_name, "")
-                comments_text = comments_by_name.get(fn_name, "")
-                signature_fragment = f" Signature: {signature_text}" if signature_text else ""
-                comments_fragment = f" Documentation: {comments_text}" if comments_text else ""
-                per_function_context_lines.append(
-                    f"- You are modernizing function '{fn_name}'. It is called by [{callers_str}] and it calls [{callees_str}].{signature_fragment}{comments_fragment} Ensure the interface remains compatible with its callers and callees."
+        if already_modernized:
+            dependency_context_sections: list[str] = []
+            for fn_name in modernization_order[:current_index]:
+                updated_fn = already_modernized.get(fn_name)
+                if not updated_fn:
+                    continue
+                dependency_context_sections.append(
+                    f"Function: {fn_name}\n{updated_fn.strip()}"
+                )
+            if dependency_context_sections:
+                prompt_parts.append(
+                    "Already-modernized dependency context (use these updated APIs/signatures):\n"
+                    + "\n\n".join(dependency_context_sections)
                 )
 
-            prompt_parts.append(
-                "Function-level call graph context (for each function, who calls it and what it calls):\n"
-                + "\n".join(per_function_context_lines)
-            )  # This comment explains that we explicitly describe per-function context to the model.
         if state["error_log"]:  # This condition checks whether previous attempts produced any feedback that needs to be fixed.
             # Distinguish between compiler failures and parity (logic) failures so we can give targeted instructions.
             if state["verification_result"].get("success") and not state.get("is_functionally_equivalent", True):
                 diff_text = state.get("diff_output") or state["error_log"]
-                prompt_parts.append(  # This call adds a section explicitly describing the parity failure and unified diff output.
+                prompt_parts.append(
                     "The code compiled, but the output changed. Fix the logic to ensure functional parity with the original program.\n"
                     "Here is a unified diff between the original and modernized program outputs:\n"
                     f"{diff_text}"
                 )
             else:
-                prompt_parts.append(  # This call adds a section describing the last compilation errors, which the model should address.
+                prompt_parts.append(
                     "Here are compilation errors from the last attempt. Fix these while modernizing:\n"
                     f"{state['error_log']}"
-                )  # This comment clarifies that we expect the model to use these errors as feedback for corrections.
-        prompt_parts.append(  # This call adds the actual source code and the final instructions on how to respond.
-            "Here is the code to modernize into valid C++20:\n"
+                )
+
+        prompt_parts.append(
+            "Current function source to modernize:\n"
             "```cpp\n"
-            f"{source_to_improve}\n"
+            f"{current_function_source}\n"
             "```\n\n"
-            "Respond with ONLY the full modernized C++20 source code, with no explanations or commentary outside the code."
-        )  # This comment explains that we instruct the model to return only code so parsing later is easier.
+            "Return ONLY the full updated code for this single function. "
+            "Do not return the whole file. Do not add explanation text."
+        )
 
         full_prompt = "\n\n".join(prompt_parts)  # This line joins all prompt sections together with blank lines so the text is readable and well structured.
 
@@ -397,8 +656,24 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             raw_text = getattr(response, "content", str(response))  # This line extracts the response text, falling back to a string form if there is no .content attribute.
 
             # The model is asked to return only code, but we still defensively strip out any markdown triple backticks so only raw code remains.
-            cleaned = re.sub(r"```(?:[^\n]*)\n?", "", raw_text)  # This line removes any lines starting with ``` (optionally followed by a language tag like cpp) from the response text.
-            modernized = cleaned.strip()  # This line trims leading and trailing whitespace so we keep just the raw code body.
+            cleaned_function = _clean_model_code_block(raw_text)
+
+            target_start = current_function_info.get("start_byte")
+            target_end = current_function_info.get("end_byte")
+            if (
+                cleaned_function
+                and isinstance(target_start, int)
+                and isinstance(target_end, int)
+                and 0 <= target_start <= target_end <= len(source_to_improve.encode("utf-8"))
+            ):
+                modernized = _replace_function_by_span(
+                    source_to_improve,
+                    target_start,
+                    target_end,
+                    cleaned_function,
+                )
+            else:
+                modernized = source_to_improve
         except Exception as exc:  # This except block catches any errors from contacting the local Ollama server.
             error_message = f"Ollama call failed in modernizer: {exc!r}"  # This line builds a human-readable description of what went wrong.
             print(error_message)  # This print displays the failure message in the console for debugging.
@@ -410,19 +685,12 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         # For non-C++ languages or missing Ollama, we keep a very simple placeholder modernization behavior.
         modernized = source_to_improve.replace("var ", "auto ")  # This line performs a minimal token replacement, just to show that some transformation happened.
 
+    # Inject any missing #include directives required by the newly written C++ code.
+    if is_cpp:
+        modernized = IncludeManager().update_file_includes(modernized, modernized)
+
     state["modernized_code"] = modernized  # This line stores the modernized (or minimally transformed) code back into the shared workflow state.
     state["attempt_count"] += 1  # This line increments the attempt counter so the router can track how many modernization passes we have performed.
-
-    if ChatOllama is not None:
-        modernization_order = state.get("modernization_order") or []
-        current_index = int(state.get("current_function_index", 0))
-        if modernization_order and 0 <= current_index < len(modernization_order):
-            current_function_name = modernization_order[current_index]
-            if current_function_name:
-                modernized_functions = state.get("modernized_functions") or {}
-                modernized_functions[current_function_name] = "modernized"
-                state["modernized_functions"] = modernized_functions
-                state["current_function_index"] = current_index + 1
 
     print(f"Modernized Code (first 200 chars):\n{modernized[:200]}...")  # This print shows the beginning of the modernized code so you can see what changed.
 
@@ -451,7 +719,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         }  # This closing brace ends the verification_result dictionary for the empty-code case.
         state["verification_result"] = verification_result  # This line stores the failure result in the shared state.
         state["error_log"] = message  # This line copies the exact error message into the error log for visibility in later inspection.
-        state["attempt_count"] = 3  # This line sets the attempt count to the max so the router will go to END and stop the loop instead of retrying.
+        state["attempt_count"] = 5  # This line sets attempts to max retry budget so the router safely terminates.
         print(f"❌ Verification FAILED: {message}")  # This print reinforces the failure message in the console.
         return state  # This return exits early so we do not try to call g++ with empty input.
 
@@ -461,12 +729,39 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
     if verification_result["success"]:  # This condition checks whether compilation finished successfully without errors.
         print("✅ Verification PASSED")  # This print confirms in the console that the modernized code compiled successfully.
         state["error_log"] = ""  # This line clears the error log because there are no compiler errors to feed back into the model.
+        state["last_working_code"] = state["modernized_code"]
+
+        target_function = state.get("current_target_function") or ""
+        if target_function:
+            updated_function_code = _extract_function_text_from_code(
+                state["modernized_code"],
+                target_function,
+            )
+            if updated_function_code:
+                modernized_functions = state.get("modernized_functions") or {}
+                modernized_functions[target_function] = updated_function_code
+                state["modernized_functions"] = modernized_functions
+
+        state["current_function_index"] = int(state.get("current_function_index", 0)) + 1
     else:  # This branch handles the case where g++ returned at least one error.
         print("❌ Verification FAILED")  # This print reports in the console that compilation failed.
         raw_stderr = verification_result.get("raw_stderr", "")
         errors_list = verification_result.get("errors") or []
         combined_error = raw_stderr or "\n".join(errors_list)
-        state["error_log"] = combined_error  # This line records the exact stderr text from g++ into the error log for the modernizer to use next time.
+        error_lines = _extract_error_line_numbers(combined_error)
+        critical_fix_section = ""
+        if error_lines:
+            first_error_line = error_lines[0]
+            focused_snippet = _get_code_snippet_by_line(code_to_verify, first_error_line)
+            critical_fix_section = (
+                "\n\nCRITICAL FIX REQUIRED: "
+                f"The compiler reported an error at Line {first_error_line}. "
+                "Look specifically at this logic:\n"
+                f"{focused_snippet}"
+            )
+
+        state["error_log"] = combined_error + critical_fix_section
+        state["modernized_code"] = state.get("last_working_code") or state["code"]
         print(f"Errors from g++:\n{state['error_log']}")  # This print shows the compiler errors so you can see exactly what went wrong.
 
     return state  # This return passes the updated state (including verification results) back into the LangGraph router.
@@ -537,35 +832,32 @@ def tester_node(state: ModernizationState) -> ModernizationState:
     return state  # This return passes the updated state (including parity info) back into the LangGraph router.
 
 
-def should_retry(state: ModernizationState) -> str:
+def surgical_router(state: ModernizationState) -> str:
     """
     Router function: Decides whether to retry modernization or proceed to END
     """
-    verification_success = bool(state["verification_result"].get("success"))  # This line normalizes the compilation success flag.
-    parity_passed = bool(state.get("is_functionally_equivalent", False))  # This line reads whether the last differential test declared functional equivalence.
-    feedback_loops = int(state.get("feedback_loop_count", 0))  # This line reads how many times we have already looped back into the modernizer.
+    verification_success = bool(state["verification_result"].get("success"))
+    parity_passed = bool(state.get("is_parity_passed", False))
+    attempt_count = int(state.get("attempt_count", 0))
 
-    # Hard stop if we have already tried multiple self-healing passes.
-    if state["attempt_count"] >= 3 or feedback_loops >= 3:
-        if not (verification_success and parity_passed):
-            if state.get("modernized_functions"):
-                state["partial_success"] = True
-        print("\n🏁 Routing to END (MAX RETRIES REACHED)")  # This print signals that the self-healing loop has exhausted its budget.
+    if parity_passed and verification_success:
+        print("\n🏁 Routing to END (SUCCESS: compilation + parity)")
         return "end"
 
-    if not verification_success:
-        # Compiler failure: route back to the modernizer with raw_stderr in error_log.
-        state["feedback_loop_count"] = feedback_loops + 1  # This line increments the feedback loop counter for a compiler failure retry.
-        print("\n🔄 Routing back to MODERNIZER (compiler failure, retrying)")  # This print explains that we are retrying due to compilation errors.
+    if attempt_count >= 5:
+        state["partial_success"] = True
+        print("\n🏁 Routing to END (PARTIAL_SUCCESS after max attempts)")
+        return "end"
+
+    if attempt_count < 5 and not verification_success:
+        print("\n🔄 Routing back to MODERNIZER (compiler failure, surgical retry)")
         return "modernizer"
 
-    if not parity_passed:
-        # Logic / parity failure: route back to the modernizer with unified_diff feedback.
-        state["feedback_loop_count"] = feedback_loops + 1  # This line increments the feedback loop counter for a parity failure retry.
-        print("\n🔄 Routing back to MODERNIZER (parity failure, self-healing)")  # This print explains that we are retrying due to a parity mismatch.
+    if attempt_count < 5 and not parity_passed:
+        print("\n🔄 Routing back to MODERNIZER (parity failure, surgical retry)")
         return "modernizer"
 
-    print("\n🏁 Routing to END (SUCCESS: compilation + parity)")  # This print signals that both compilation and parity passed.
+    print("\n🏁 Routing to END")
     return "end"
 
 
@@ -591,7 +883,7 @@ def build_workflow():
     # Conditional edge from tester based on compilation and parity results
     workflow.add_conditional_edges(
         "tester",
-        should_retry,
+        surgical_router,
         {
             "modernizer": "modernizer",
             "end": END
@@ -634,6 +926,8 @@ def run_modernization_workflow(code: str, language: str = "python"):
         modernized_functions={},
         current_function_index=0,
         partial_success=False,
+        last_working_code=code,
+        current_target_function="",
     )
     
     # Build and run the workflow
@@ -665,7 +959,6 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
         print(f"📄 Loaded test.cpp ({len(cpp_code)} characters)")  # This print confirms the file was loaded and shows its size.
     except FileNotFoundError:  # This except block runs if test.cpp does not exist at the expected path.
         print("❌ test.cpp not found at", _test_cpp_path)  # This print tells the user where the script looked for the file.
-        exit(1)  # This line stops the script so the user can add test.cpp or fix the path.
-
-    # Once the connection is verified, run the full modernization loop on the C++ code from test.cpp.
+        exit(1)  
+        
     result = run_modernization_workflow(cpp_code, language="cpp")  # This line invokes the full workflow (analyzer -> modernizer -> verifier with retries) on the loaded code.

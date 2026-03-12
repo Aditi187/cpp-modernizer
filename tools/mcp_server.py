@@ -1,22 +1,31 @@
-import os  # This import lets us work with file paths on your computer, for example to check whether a path is a file.
-import shlex  # This import provides a safe way to split a command string (like 'g++ main.cpp') into the list format Python's subprocess expects.
-import subprocess  # This import allows Python to start other programs on your computer, such as compilers like g++ or javac.
-import re  # This import allows us to detect line/column patterns (like 'file.cpp:10:5') inside compiler output text.
+import os  
+import shlex  
+import subprocess  
+import re  
+import glob
+import sys
+from datetime import datetime
 
-from typing import Optional  # This import lets us describe that a value might be missing (None), which helps document the behavior of our functions.
+from typing import Optional 
+from fastmcp import FastMCP  
 
-from fastmcp import FastMCP  # This import brings in the FastMCP class, which builds a Model Context Protocol server around our Python functions.
+# Make the project root importable so we can reach core.parser.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from core.parser import CppParser
+    _PARSER_AVAILABLE = True
+except Exception:
+    _PARSER_AVAILABLE = False
 
 
-# Create a single MCP server instance that will host all of our tools.
-mcp_server = FastMCP("air-gapped-code-tools")  # This line creates the MCP server with a short name so the AI client can recognize and connect to it.
+
+mcp_server = FastMCP("air-gapped-code-tools")  
 
 
-# Define the root directory that tools are allowed to access on disk.
-# All file paths used by tools must stay within this directory to maintain a simple sandbox.
 ALLOWED_ROOT = os.path.abspath(
     os.getcwd()
-)  # This constant captures the server's start directory as the allowed sandbox root.
+)  
 
 
 def _contains_parent_traversal(path: str) -> bool:
@@ -61,33 +70,35 @@ def _ensure_within_allowed_root(path: str) -> str:
     return absolute_path
 
 
-@mcp_server.tool()  # This decorator tells FastMCP that the function below should be exposed as an MCP tool the AI can call.
-def read_code(file_path: str) -> str:  # This function definition declares the read_code tool, which takes a file path as text and returns the file contents as text.
+def _tool_log(tool_name: str, detail: str) -> None:
+    """Write a concise tool-invocation log line to stderr."""
+
+    print(f"Tool '{tool_name}' called: {detail}", file=sys.stderr, flush=True)
+
+
+@mcp_server.tool() 
+def read_code(file_path: str) -> str:  
     """
     Read the contents of a text file from the local filesystem.
 
     The function returns either the full file contents on success,
     or a readable error message string if something goes wrong.
-    """  # This triple-quoted string explains in plain English what the read_code tool does and how its result should be interpreted.
+    """  
 
-    # Explain our input in simple language.
-    # - file_path: a string giving either an absolute path like "C:\\my_folder\\code.cpp"
-    #              or a relative path like "src/main.cpp" from where the server is running.
+    _tool_log("read_code", f"file_path='{file_path}'")
 
     try:
-        # Enforce that the requested path is inside the ALLOWED_ROOT sandbox and
-        # does not rely on parent-directory traversal like "..".
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
         return f"ERROR: {sandbox_error}"
 
-    # First, we check whether the path actually points to a real file on disk.
+  
     if not os.path.isfile(
         absolute_path
-    ):  # This condition tests if file_path refers to a normal file; if it does not, we treat that as an error.
+    ):  
         return f"ERROR: File not found or not a regular file: {absolute_path}"  # This return sends back a clear, human-friendly error message when the file does not exist.
 
-    try:  # This keyword starts a block where we will attempt to read the file, catching any problems that might occur.
+    try:  
         with open(
             absolute_path, "r", encoding="utf-8"
         ) as file_handle:  # This line opens the file for reading as text using UTF-8, and gives us a handle named file_handle.
@@ -110,6 +121,8 @@ def write_code(file_path: str, content: str) -> str:
     If parent directories do not yet exist (but are still inside ALLOWED_ROOT),
     they are created automatically. The file is written using UTF-8 encoding.
     """
+
+    _tool_log("write_code", f"file_path='{file_path}', content_len={len(content)}")
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
@@ -188,7 +201,6 @@ def _append_location_hints(
         "You should inspect these files at the indicated lines (and columns, when present):",
     ]
 
-    # Sort for deterministic, easy-to-skim output.
     for file_name, line, column in sorted(locations):
         if column is not None:
             hint_lines.append(f"- {file_name}, line {line}, column {column}")
@@ -205,22 +217,17 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str: 
 
     On success, the function returns a message that includes any output from the compiler.
     On failure, the function returns a message that focuses on the error output so you can see what went wrong.
-    """  # This triple-quoted string documents in plain English how to use run_compiler and what kind of information it returns.
+    """  
+    _tool_log(
+        "run_compiler",
+        f"command='{command}', working_directory='{working_directory or '.'}'",
+    )
 
-    # Explain our inputs in simple language.
-    # - command: a single string exactly as you would type it in a terminal,
-    #            for example "g++ -Wall main.cpp" or "javac MyProgram.java".
-    # - working_directory: an optional folder path where the command should be run;
-    #                      if you leave it empty, the server runs the command in its own start folder.
-
-    # Convert the single command string into a list of parts understood by subprocess without using the shell.
-    try:  # This try block wraps the parsing step so we can handle malformed command strings gracefully.
-        command_parts = shlex.split(command)  # This line safely breaks the command string into pieces, for example "g++ -Wall main.cpp" becomes ["g++", "-Wall", "main.cpp"].
+    try:   
+        command_parts = shlex.split(command)   
     except ValueError as error:  # This except branch triggers if the command string has mismatched quotes or other parsing issues.
         return f"ERROR: Could not parse the command string: {error!r}"  # This return gives a clear explanation that the problem is with how the command text was written.
 
-    # If the caller gave us a working directory, we double-check that it exists,
-    # is actually a directory, and remains inside the ALLOWED_ROOT sandbox.
     if working_directory is not None:
         try:
             working_directory_resolved = _ensure_within_allowed_root(working_directory)
@@ -299,6 +306,8 @@ def run_binary(path: str, timeout: int = 5) -> str:
     to prevent infinite loops or long-running programs from hanging the server.
     """
 
+    _tool_log("run_binary", f"path='{path}', timeout={timeout}")
+
     try:
         absolute_path = _ensure_within_allowed_root(path)
     except ValueError as sandbox_error:
@@ -311,25 +320,46 @@ def run_binary(path: str, timeout: int = 5) -> str:
     # used by the program remain project-local.
     working_directory = os.path.dirname(absolute_path) or ALLOWED_ROOT
 
-    try:
-        completed_process = subprocess.run(
-            [absolute_path],
-            cwd=working_directory,
-            capture_output=True,
-            text=True,
-            timeout=max(1, int(timeout)),
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            f"ERROR: Binary execution exceeded timeout of {timeout} seconds and was terminated."
-        )
-    except PermissionError:
-        return (
-            "ERROR: Permission denied when trying to execute the binary. "
-            "Ensure the file has execute permissions."
-        )
-    except Exception as error:
-        return f"ERROR: Unexpected problem while running the binary: {error!r}"
+    normalized_timeout = max(1, int(timeout))
+    completed_process = None
+    permission_retry_attempted = False
+
+    while True:
+        try:
+            completed_process = subprocess.run(
+                [absolute_path],
+                cwd=working_directory,
+                capture_output=True,
+                text=True,
+                timeout=normalized_timeout,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            return (
+                f"ERROR: Binary execution exceeded timeout of {timeout} seconds and was terminated."
+            )
+        except PermissionError as permission_error:
+            if permission_retry_attempted:
+                return (
+                    "ERROR: Permission denied when trying to execute the binary, "
+                    "even after applying executable permissions. "
+                    f"Details: {permission_error!r}"
+                )
+
+            permission_retry_attempted = True
+            _tool_log(
+                "run_binary",
+                f"permission denied for '{absolute_path}', attempting chmod 755 and retry",
+            )
+            try:
+                os.chmod(absolute_path, 0o755)
+            except Exception as chmod_error:
+                return (
+                    "ERROR: Permission denied when executing the binary and failed "
+                    f"to apply chmod 755: {chmod_error!r}"
+                )
+        except Exception as error:
+            return f"ERROR: Unexpected problem while running the binary: {error!r}"
 
     exit_code = completed_process.returncode
     standard_output = (completed_process.stdout or "").strip()
@@ -370,6 +400,8 @@ def list_directory(path: str) -> str:
     Returns a human-readable listing of files and subdirectories.
     """
 
+    _tool_log("list_directory", f"path='{path}'")
+
     # Allow an empty string or '.' to mean the sandbox root.
     target = path or "."
 
@@ -398,6 +430,409 @@ def list_directory(path: str) -> str:
             lines.append(f"[FILE] {name}")
 
     return "\n".join(lines)
+
+
+@mcp_server.tool()
+def list_tree(path: str, depth: int = 2) -> str:
+    """
+    Render a visual directory tree from a path inside the sandbox.
+
+    The depth parameter controls how many nested levels are expanded.
+    """
+
+    _tool_log("list_tree", f"path='{path}', depth={depth}")
+
+    target = path or "."
+    try:
+        absolute_path = _ensure_within_allowed_root(target)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
+
+    if not os.path.isdir(absolute_path):
+        return f"ERROR: Not a directory or does not exist: {absolute_path}"
+
+    max_depth = max(0, int(depth))
+    root_display = os.path.relpath(absolute_path, ALLOWED_ROOT)
+    if root_display == ".":
+        root_display = os.path.basename(ALLOWED_ROOT) or ALLOWED_ROOT
+
+    lines: list[str] = [f"Tree for {root_display} (depth={max_depth}):"]
+
+    def _walk(current_path: str, prefix: str, current_depth: int) -> None:
+        if current_depth >= max_depth:
+            return
+
+        try:
+            entries = sorted(os.listdir(current_path))
+        except Exception as error:
+            lines.append(f"{prefix}[ERROR] {error!r}")
+            return
+
+        for index, entry in enumerate(entries):
+            full_path = os.path.join(current_path, entry)
+            is_last = index == len(entries) - 1
+            connector = "`-- " if is_last else "|-- "
+            child_prefix = "    " if is_last else "|   "
+
+            if os.path.isdir(full_path):
+                lines.append(f"{prefix}{connector}{entry}/")
+                _walk(full_path, prefix + child_prefix, current_depth + 1)
+            else:
+                lines.append(f"{prefix}{connector}{entry}")
+
+    _walk(absolute_path, prefix="", current_depth=0)
+    return "\n".join(lines)
+
+
+@mcp_server.tool()
+def search_code(query: str, file_pattern: str = "*") -> str:
+    """
+    Search text across project files using glob + regex.
+
+    Returns matching lines in a grep-like "file:line: content" format.
+    """
+
+    _tool_log("search_code", f"query='{query}', file_pattern='{file_pattern}'")
+
+    if not query:
+        return "ERROR: Query must be a non-empty regex string."
+
+    try:
+        regex = re.compile(query)
+    except re.error as regex_error:
+        return f"ERROR: Invalid regex query: {regex_error}"
+
+    pattern = file_pattern or "*"
+    glob_pattern = os.path.join(ALLOWED_ROOT, "**", pattern)
+    candidate_paths = glob.glob(glob_pattern, recursive=True)
+
+    # Keep only regular files inside ALLOWED_ROOT.
+    files: list[str] = []
+    for matched in candidate_paths:
+        if not os.path.isfile(matched):
+            continue
+        try:
+            _ensure_within_allowed_root(matched)
+        except ValueError:
+            continue
+        files.append(matched)
+
+    files = sorted(set(files))
+    if not files:
+        return f"No files matched pattern '{pattern}'."
+
+    matches: list[str] = []
+    files_scanned = 0
+    files_with_decode_errors = 0
+    max_results = 500
+
+    for file_path in files:
+        files_scanned += 1
+        try:
+            with open(file_path, "r", encoding="utf-8") as handle:
+                for line_number, line_text in enumerate(handle, start=1):
+                    if regex.search(line_text):
+                        rel_path = os.path.relpath(file_path, ALLOWED_ROOT)
+                        matches.append(f"{rel_path}:{line_number}: {line_text.rstrip()}")
+                        if len(matches) >= max_results:
+                            break
+        except UnicodeDecodeError:
+            files_with_decode_errors += 1
+        except Exception:
+            continue
+
+        if len(matches) >= max_results:
+            break
+
+    if not matches:
+        return (
+            f"No matches found for /{query}/ across {files_scanned} files "
+            f"(pattern='{pattern}')."
+        )
+
+    header = [
+        f"Found {len(matches)} matches for /{query}/ in {files_scanned} files "
+        f"(pattern='{pattern}')."
+    ]
+    if files_with_decode_errors:
+        header.append(
+            f"Skipped {files_with_decode_errors} non-text file(s) due to UTF-8 decode errors."
+        )
+    if len(matches) >= max_results:
+        header.append(f"Results truncated at {max_results} matches.")
+
+    return "\n".join(header + [""] + matches)
+
+
+@mcp_server.tool()
+def get_file_info(file_path: str) -> str:
+    """
+    Return metadata for a file: size, modified time, and line count.
+    """
+
+    _tool_log("get_file_info", f"file_path='{file_path}'")
+
+    try:
+        absolute_path = _ensure_within_allowed_root(file_path)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
+
+    if not os.path.isfile(absolute_path):
+        return f"ERROR: File not found or not a regular file: {absolute_path}"
+
+    try:
+        stat_info = os.stat(absolute_path)
+        size_bytes = stat_info.st_size
+        modified_iso = datetime.fromtimestamp(stat_info.st_mtime).isoformat()
+
+        line_count = 0
+        with open(absolute_path, "r", encoding="utf-8") as handle:
+            for _ in handle:
+                line_count += 1
+
+        relative_path = os.path.relpath(absolute_path, ALLOWED_ROOT)
+        return (
+            f"File: {relative_path}\n"
+            f"Size (bytes): {size_bytes}\n"
+            f"Last modified: {modified_iso}\n"
+            f"Line count: {line_count}"
+        )
+    except UnicodeDecodeError:
+        return (
+            "ERROR: Could not decode the file as UTF-8 for line counting. "
+            "File may be binary or use a different encoding."
+        )
+    except Exception as error:
+        return f"ERROR: Unexpected problem while gathering file info: {error!r}"
+
+
+# ---------------------------------------------------------------------------
+# Helpers for get_context_for_function
+# ---------------------------------------------------------------------------
+
+_PRIMITIVE_TYPES: set[str] = {
+    "int", "float", "double", "char", "bool", "void", "long", "short",
+    "unsigned", "signed", "auto", "size_t", "ptrdiff_t", "nullptr_t",
+    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+    "int8_t",  "int16_t",  "int32_t",  "int64_t",
+    "wchar_t", "char8_t", "char16_t", "char32_t",
+    # common macros / keywords that look like identifiers
+    "const", "static", "inline", "virtual", "explicit", "constexpr",
+    "override", "final", "typename", "class", "struct", "enum",
+    "template", "namespace", "return", "new", "delete", "nullptr",
+}
+
+
+def _extract_candidate_type_names(text: str) -> list[str]:
+    """Return unique identifier tokens from *text* that might be custom C++ types.
+
+    Filters out primitive types, keywords, and ``std::`` identifiers.
+    """
+    tokens = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', text)
+    seen: set[str] = set()
+    result: list[str] = []
+    for tok in tokens:
+        if tok in seen or tok in _PRIMITIVE_TYPES or tok.startswith("std"):
+            continue
+        seen.add(tok)
+        result.append(tok)
+    return result
+
+
+def _classify_ownership(source_code: str) -> list[str]:
+    """Infer ownership / lifecycle notes from a type's source code."""
+    hints: list[str] = []
+
+    # Deleted copy constructor / copy-assignment operator → non-copyable
+    if re.search(r'=\s*delete', source_code):
+        if re.search(r'\b(operator\s*=|\w+\s*\(\s*const\s+\w+\s*&)', source_code):
+            hints.append("non-copyable (copy constructor or assignment deleted)")
+        else:
+            hints.append("has explicitly deleted special member(s)")
+
+    # Exclusive ownership
+    if re.search(r'\bstd::unique_ptr\b', source_code):
+        hints.append("owns exclusive resource via std::unique_ptr — not copyable by default")
+
+    # Shared ownership
+    if re.search(r'\bstd::shared_ptr\b', source_code):
+        hints.append("shares ownership via std::shared_ptr")
+
+    # Polymorphic base
+    if re.search(r'\bvirtual\b', source_code):
+        hints.append("polymorphic (has virtual method(s)); prefer pointer/reference semantics")
+
+    # Explicit destructor — likely manages a resource
+    if re.search(r'~\w+\s*\(', source_code):
+        hints.append("manages resources (explicit destructor defined)")
+
+    return hints if hints else ["standard value semantics (copyable and movable)"]
+
+
+def _collect_type_bundle(
+    seed_type_names: list[str],
+    type_definitions: dict[str, str],
+    types_meta: list[dict],
+) -> dict[str, dict]:
+    """Recursively resolve *seed_type_names* and all their base classes.
+
+    Returns ``{type_name: {source_code, bases, ownership_hints}}``.
+    Only types present in *type_definitions* are included.
+    """
+    name_to_meta: dict[str, dict] = {}
+    for t in types_meta:
+        n = str(t.get("name") or "")
+        if n:
+            name_to_meta[n] = t
+
+    bundle: dict[str, dict] = {}
+    queue = list(seed_type_names)
+    visited: set[str] = set()
+
+    while queue:
+        type_name = queue.pop(0)
+        if type_name in visited:
+            continue
+        visited.add(type_name)
+
+        source_code = type_definitions.get(type_name)
+        if source_code is None:
+            continue  # Not a known custom type in this file.
+
+        meta = name_to_meta.get(type_name, {})
+        bases = [str(b) for b in (meta.get("bases") or [])]
+        ownership_hints = _classify_ownership(source_code)
+
+        bundle[type_name] = {
+            "source_code": source_code,
+            "bases": bases,
+            "ownership_hints": ownership_hints,
+        }
+
+        # Queue base classes for recursive resolution.
+        queue.extend(b for b in bases if b not in visited)
+
+    return bundle
+
+
+def _format_type_bundle(bundle: dict[str, dict]) -> str:
+    """Render the type bundle as a structured, LLM-readable section."""
+    if not bundle:
+        return ""
+
+    lines: list[str] = ["=== TYPE BUNDLE (memory layout & ownership model) ==="]
+    for type_name in sorted(bundle):
+        info = bundle[type_name]
+        lines.append(f"\n--- Type: {type_name} ---")
+        bases = info.get("bases") or []
+        if bases:
+            lines.append(f"Inherits from: {', '.join(bases)}")
+        hints = info.get("ownership_hints") or []
+        lines.append(f"Ownership/Lifecycle: {'; '.join(hints)}")
+        lines.append("Definition:")
+        lines.append(str(info.get("source_code", "")))
+
+    return "\n".join(lines)
+
+
+@mcp_server.tool()
+def get_context_for_function(file_path: str, function_fqn: str) -> str:
+    """
+    Return a rich modernization context bundle for a single C++ function.
+
+    The bundle contains four sections:
+
+    1. **Function context** — full signature and body of the requested function.
+    2. **Called function signatures** — signatures of every internally called function
+       so the LLM respects existing contracts.
+    3. **Type Bundle** — definitions of every custom struct/class used in the
+       function's parameters or return type, resolved recursively through the
+       class hierarchy (base classes are included too), each annotated with
+       ownership and lifecycle notes (non-copyable, polymorphic, etc.).
+    4. **Required headers** — ``#include`` directives inferred for this function.
+
+    This context is designed to let an LLM modernize the function safely and
+    produce immediately compilable C++ without misunderstanding ownership.
+    """
+    _tool_log(
+        "get_context_for_function",
+        f"file_path='{file_path}', function_fqn='{function_fqn}'",
+    )
+
+    if not _PARSER_AVAILABLE:
+        return (
+            "ERROR: CppParser is unavailable. "
+            "Ensure 'tree-sitter-cpp' is installed in the active virtual environment."
+        )
+
+    if not function_fqn or not function_fqn.strip():
+        return "ERROR: function_fqn must be a non-empty fully-qualified function name."
+
+    try:
+        absolute_path = _ensure_within_allowed_root(file_path)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
+
+    if not os.path.isfile(absolute_path):
+        return f"ERROR: File not found or not a regular file: {absolute_path}"
+
+    try:
+        parser = CppParser()
+        project_map = parser.parse_file(absolute_path)
+    except Exception as exc:
+        return f"ERROR: Failed to parse C++ file: {exc!r}"
+
+    functions: dict = project_map.get("functions") or {}
+    if not isinstance(functions, dict) or function_fqn not in functions:
+        available = sorted(functions.keys()) if isinstance(functions, dict) else []
+        return (
+            f"ERROR: Function '{{function_fqn}}' not found in {os.path.basename(absolute_path)}.\n"
+            f"Available FQNs: {available}"
+        ).replace("{{function_fqn}}", function_fqn)
+
+    try:
+        base_context = parser.get_context_for_function(function_fqn)
+    except Exception as exc:
+        return f"ERROR: Context extraction failed: {exc!r}"
+
+    fn_meta = functions[function_fqn]
+    signature = str(fn_meta.get("signature") or "")
+    body = str(base_context.get("body") or "")
+    called_signatures: dict = base_context.get("called_function_signatures") or {}
+
+    # Collect seed type names from structured parameters + full signature text.
+    parameters: list = fn_meta.get("parameters") or []
+    param_type_text = " ".join(str(p.get("type") or "") for p in parameters)
+    seed_candidates = _extract_candidate_type_names(param_type_text + " " + signature)
+
+    type_definitions: dict = project_map.get("type_definitions") or {}
+    types_meta: list = project_map.get("types") or []
+
+    # Only keep candidates that are recognized custom types in this translation unit.
+    seed_types = [t for t in seed_candidates if t in type_definitions]
+    type_bundle = _collect_type_bundle(seed_types, type_definitions, types_meta)
+
+    # --- Format output sections ---
+    sections: list[str] = []
+
+    sections.append(f"=== FUNCTION CONTEXT: {function_fqn} ===")
+    sections.append(f"\nSignature:\n{signature}")
+    sections.append(f"\nBody:\n{body}")
+
+    if called_signatures:
+        sections.append("\n=== CALLED FUNCTION SIGNATURES ===")
+        for callee_fqn, callee_sig in sorted(called_signatures.items()):
+            sections.append(f"  {callee_fqn}:\n    {callee_sig}")
+
+    type_bundle_text = _format_type_bundle(type_bundle)
+    if type_bundle_text:
+        sections.append("\n" + type_bundle_text)
+
+    include_reqs: list = (project_map.get("include_requirements") or {}).get(function_fqn, [])
+    if include_reqs:
+        sections.append(f"\n=== REQUIRED HEADERS ===\n{', '.join(include_reqs)}")
+
+    return "\n".join(sections)
 
 
 if __name__ == "__main__":  # This line checks whether this file is being run directly as a script rather than being imported as a module.

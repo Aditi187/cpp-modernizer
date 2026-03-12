@@ -1,10 +1,71 @@
 import os
+import platform
+import re
 import subprocess
 import tempfile
 import time
 import shutil
 from dataclasses import dataclass
 from difflib import unified_diff
+
+
+# ---------------------------------------------------------------------------
+# Sanitizer configuration
+# ---------------------------------------------------------------------------
+
+_SANITIZER_COMPILE_FLAGS: list[str] = [
+    "-fsanitize=address,undefined",
+    "-fno-omit-frame-pointer",
+]
+
+_SANITIZER_ERROR_PATTERN = re.compile(
+    r"(?:AddressSanitizer|UndefinedBehaviorSanitizer|LeakSanitizer|ERROR:\s*(?:address|leak|undefined))",
+    re.IGNORECASE,
+)
+
+
+def _detect_sanitizer_errors(stderr_text: str) -> list[str]:
+    """Return a list of sanitizer diagnostic lines found in *stderr_text*."""
+    if not stderr_text:
+        return []
+    findings: list[str] = []
+    for line in stderr_text.splitlines():
+        if _SANITIZER_ERROR_PATTERN.search(line):
+            findings.append(line.strip())
+    return findings
+
+
+def _parse_peak_memory_kb(stderr_text: str) -> int | None:
+    """Extract peak resident-set size (KB) from ASan or /usr/bin/time output.
+
+    AddressSanitizer prints a stats line like::
+
+        SUMMARY: AddressSanitizer: 1234 byte(s) allocated
+
+    or on Linux with ``ASAN_OPTIONS=print_stats=1``:
+
+        ==PID== ASAN: ... rss: 12345 kB
+
+    We also recognise GNU ``/usr/bin/time -v`` output::
+
+        Maximum resident set size (kbytes): 12345
+
+    Returns *None* when no metric is found.
+    """
+    if not stderr_text:
+        return None
+
+    # GNU time -v format
+    m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr_text)
+    if m:
+        return int(m.group(1))
+
+    # ASan stats (bytes allocated → convert to KB)
+    m = re.search(r"(\d+)\s+byte\(s\)\s+allocated", stderr_text)
+    if m:
+        return max(1, int(m.group(1)) // 1024)
+
+    return None
 
 
 def resolve_gpp_exe(explicit_path: str | None = None) -> str:
@@ -40,6 +101,7 @@ def compile_cpp_source(
     code: str,
     gpp_exe: str | None = None,
     timeout_seconds: int = 10,
+    enable_sanitizers: bool = True,
 ) -> dict:
     compiler = resolve_gpp_exe(gpp_exe)
     _verify_compiler(compiler)
@@ -54,6 +116,8 @@ def compile_cpp_source(
             cpp_file.write(code)
 
         cmd = [compiler, "-std=c++20", "-Wall", cpp_path, "-o", exe_path]
+        if enable_sanitizers:
+            cmd[2:2] = _SANITIZER_COMPILE_FLAGS
 
         try:
             result = subprocess.run(
@@ -125,6 +189,7 @@ def _compile_and_run_cpp(
     tmp_dir: str,
     exe_name: str,
     input_data: str | None = None,
+    enable_sanitizers: bool = True,
 ) -> dict:
     _verify_compiler(gpp_exe)
 
@@ -132,6 +197,14 @@ def _compile_and_run_cpp(
 
     compile_start = time.time()
     compile_cmd = [gpp_exe, "-std=c++20", "-Wall", source_path, "-o", exe_path]
+    if enable_sanitizers:
+        compile_cmd[2:2] = _SANITIZER_COMPILE_FLAGS
+
+    # Tell ASan to report leaks and print stats so we can extract peak memory.
+    sanitizer_env = dict(os.environ)
+    if enable_sanitizers:
+        sanitizer_env["ASAN_OPTIONS"] = "detect_leaks=1:print_stats=1:halt_on_error=0"
+        sanitizer_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=0"
 
     try:
         compile_result = subprocess.run(
@@ -140,6 +213,7 @@ def _compile_and_run_cpp(
             text=True,
             encoding="utf-8",
             timeout=10,
+            env=sanitizer_env,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -183,6 +257,7 @@ def _compile_and_run_cpp(
             text=True,
             encoding="utf-8",
             timeout=10,
+            env=sanitizer_env,
         )
     except subprocess.TimeoutExpired as exc:
         return {
@@ -209,6 +284,9 @@ def _compile_and_run_cpp(
     stderr_text = (run_result.stderr or "").strip()
     run_success = run_result.returncode == 0
 
+    sanitizer_findings = _detect_sanitizer_errors(stderr_text)
+    peak_memory_kb = _parse_peak_memory_kb(stderr_text)
+
     return {
         "compile_success": True,
         "run_success": run_success,
@@ -216,6 +294,8 @@ def _compile_and_run_cpp(
         "stderr": stderr_text,
         "compile_time_ms": compile_time_ms,
         "run_time_ms": run_time_ms,
+        "sanitizer_findings": sanitizer_findings,
+        "peak_memory_kb": peak_memory_kb,
     }
 
 
@@ -242,6 +322,9 @@ class DifferentialTestResult:
     original: dict
     modernized: dict
     gpp_exe: str
+    sanitizer_clean: bool = True
+    sanitizer_findings: list[str] | None = None
+    memory_delta_kb: int | None = None
 
 
 def run_differential_test(
@@ -311,6 +394,7 @@ def run_differential_test(
             tmp_dir,
             "original.exe",
             input_data=input_data,
+            enable_sanitizers=False,  # Don't sanitize legacy code—only the modernized version.
         )
 
         if not (original_result["compile_success"] and original_result["run_success"]):
@@ -335,6 +419,7 @@ def run_differential_test(
             tmp_dir,
             "modernized.exe",
             input_data=input_data,
+            enable_sanitizers=True,
         )
 
         if not modernized_result["compile_success"]:
@@ -365,13 +450,30 @@ def run_differential_test(
         norm_orig = _normalize_output(original_result["stdout"])
         norm_mod = _normalize_output(modernized_result["stdout"])
 
+        # --- Sanitizer & memory analysis on the *modernized* run ---
+        mod_sanitizer_findings = modernized_result.get("sanitizer_findings") or []
+        sanitizer_clean = len(mod_sanitizer_findings) == 0
+
+        orig_peak = original_result.get("peak_memory_kb")
+        mod_peak = modernized_result.get("peak_memory_kb")
+        memory_delta_kb: int | None = None
+        if orig_peak is not None and mod_peak is not None:
+            memory_delta_kb = mod_peak - orig_peak  # negative = improvement
+
         if norm_orig == norm_mod:
+            # Even if stdout matches, flag failure when sanitizers detected issues.
             return DifferentialTestResult(
-                parity_ok=True,
-                diff_text="",
+                parity_ok=sanitizer_clean,  # fail if sanitizer found problems
+                diff_text="" if sanitizer_clean else (
+                    "Output matched, but sanitizer detected issues:\n"
+                    + "\n".join(mod_sanitizer_findings)
+                ),
                 original=original_result,
                 modernized=modernized_result,
                 gpp_exe=compiler,
+                sanitizer_clean=sanitizer_clean,
+                sanitizer_findings=mod_sanitizer_findings if mod_sanitizer_findings else None,
+                memory_delta_kb=memory_delta_kb,
             ).__dict__
 
         orig_lines = (norm_orig + "\n").splitlines(keepends=True)
@@ -396,4 +498,7 @@ def run_differential_test(
             original=original_result,
             modernized=modernized_result,
             gpp_exe=compiler,
+            sanitizer_clean=sanitizer_clean,
+            sanitizer_findings=mod_sanitizer_findings if mod_sanitizer_findings else None,
+            memory_delta_kb=memory_delta_kb,
         ).__dict__
