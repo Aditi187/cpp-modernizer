@@ -42,7 +42,7 @@ This engine parses legacy C++ source files, builds a dependency graph, and runs 
 
 ```bash
 # Clone the repository
-git clone <repo-url>
+git clone <https://github.com/Aditi187/Air-Gapped-Codebase-Modernization-Engine/tree/main>
 cd air-gapped-codebase-modernization-engine
 
 # Create and activate a virtual environment

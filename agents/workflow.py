@@ -14,8 +14,10 @@ import os
 import re
 import tempfile
 import requests
+import time
+from dotenv import load_dotenv
 
-from langchain_ollama import ChatOllama
+load_dotenv()  # Load .env file from project root before reading env vars
 
 from core.parser import extract_functions_from_cpp_file
 from core.graph import (
@@ -29,22 +31,116 @@ from core.differential_tester import (
 )
 
 
-def check_ollama_health() -> bool:
+# ---------------------------------------------------------------------------
+# OpenRouter configuration
+# ---------------------------------------------------------------------------
+
+# Read key from environment; you can also hard-code it here for local testing.
+api_key: str = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_ENDPOINT: str = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
+
+_OPENROUTER_SYSTEM_PROMPT: str = (
+    "You are a Master C++20 Developer with access to MCP tools. "
+    "When modernizing C++ code, you MUST provide the ENTIRE file content in the `write_code` "
+    "tool call. Never truncate or use placeholders like // ...rest of code. "
+    "Never use JavaScript keywords like 'function'. "
+    "Always use proper C++ syntax (for example: 'int main()', 'auto', 'void', correct return "
+    "types, and semicolons). Perform surgical refactors that preserve behavior exactly."
+)
+
+
+def call_openrouter(system_prompt: str, user_prompt: str) -> str:
+    """Call the OpenRouter chat-completions endpoint with exponential backoff.
+
+    Retries up to 5 times (delays: 1s, 2s, 4s, 8s, 16s) on 429 and 5xx errors.
+    Raises RuntimeError if all attempts fail.
     """
-    Health check at the very beginning of the script: pings the local Ollama server (usually at http://localhost:11434).
-    Returns True if the server responds; otherwise prints a clear message and returns False.
-    """  # This docstring explains the purpose of the health check in plain English.
-    try:  # This try block attempts to reach the Ollama API so we know the application is running.
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)  # This line sends a GET request to the standard Ollama port; timeout avoids hanging.
-        if response.status_code == 200:  # This condition checks that Ollama returned a normal success response.
-            print("✅ OLLAMA CONNECTION VERIFIED")  # This print confirms that the health check passed so the user knows the script can proceed.
-            return True  # This return tells the caller that Ollama is running and the modernization loop can run.
-        else:  # This branch handles any non-200 response from the server.
-            print("OLLAMA NOT RUNNING: Please start the Ollama application.")  # This print gives the user a clear, actionable message.
-            return False  # This return tells the caller not to run the workflow until Ollama is started.
-    except requests.exceptions.RequestException:  # This except block runs when we cannot connect at all (e.g. connection refused or timeout).
-        print("OLLAMA NOT RUNNING: Please start the Ollama application.")  # This line prints exactly the message requested so the user knows what to do.
-        return False  # This return ensures the script does not continue without a working Ollama server.
+    if not api_key:
+        raise ValueError(
+            "api_key is empty. Please set your OpenRouter API key in agents/workflow.py."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.2,
+    }
+
+    retry_delays = [1, 2, 4, 8, 16]
+    last_exc: Exception | None = None
+
+    for attempt, delay in enumerate(retry_delays, start=1):
+        try:
+            response = requests.post(
+                OPENROUTER_ENDPOINT,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+            elif response.status_code == 429:
+                print(
+                    f"⚠️  OpenRouter rate limited (429). "
+                    f"Retrying in {delay}s... (attempt {attempt}/5)"
+                )
+            elif 500 <= response.status_code < 600:
+                print(
+                    f"⚠️  OpenRouter server error {response.status_code}. "
+                    f"Retrying in {delay}s... (attempt {attempt}/5)"
+                )
+            else:
+                # Non-retryable client errors (4xx other than 429).
+                raise RuntimeError(
+                    f"OpenRouter returned {response.status_code}: {response.text}"
+                )
+        except RuntimeError:
+            raise
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            print(
+                f"⚠️  Network error contacting OpenRouter: {exc}. "
+                f"Retrying in {delay}s... (attempt {attempt}/5)"
+            )
+
+        if attempt < len(retry_delays):
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"OpenRouter call failed after 5 attempts. Last error: {last_exc!r}"
+    )
+
+
+def check_openrouter_health() -> bool:
+    """Verify the OpenRouter API key is set and the endpoint is reachable."""
+    if not api_key:
+        print("❌ api_key is empty. Please fill in your OpenRouter API key in agents/workflow.py.")
+        return False
+    try:
+        response = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+        if response.status_code == 200:
+            print("✅ OPENROUTER CONNECTION VERIFIED")
+            return True
+        else:
+            print(f"❌ OpenRouter returned status {response.status_code}. Check your API key.")
+            return False
+    except requests.exceptions.RequestException as exc:
+        print(f"❌ Could not reach OpenRouter: {exc}")
+        return False
 
 
 def _parse_functions_from_source(source_code: str) -> list[dict[str, Any]]:
@@ -585,7 +681,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     modernized = source_to_improve  # This line initializes the modernized code to the source as a safe default in case the model call fails.
     state["current_target_function"] = ""
 
-    if is_cpp and ChatOllama is not None:  # This condition ensures we only call the local Ollama model when we have both C++ code and the library installed.
+    if is_cpp:
         functions_info = _parse_functions_from_source(source_to_improve)
         functions_by_name: dict[str, dict[str, Any]] = {
             str(fn.get("name") or ""): fn for fn in functions_info if fn.get("name")
@@ -618,12 +714,6 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
         # Build a detailed natural-language prompt that explains the task and enforces strict C++20 rules for the deepseek-coder model.
         prompt_parts: list[str] = []  # This list will collect different sections of the prompt before joining them into a single string.
-        prompt_parts.append(
-            "You are a Master C++20 Developer. "
-            "Never use JavaScript keywords like 'function'. "
-            "Always use proper C++ syntax (for example: 'int main()', 'auto', 'void', correct return types, and semicolons). "
-            "Perform a surgical refactor while preserving behavior."
-        )
         prompt_parts.append(
             f"Modernize only the function [{current_function_name}]. "
             f"Keep the signature compatible with its callers: [{callers_display}]."
@@ -678,11 +768,9 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
         full_prompt = "\n\n".join(prompt_parts)  # This line joins all prompt sections together with blank lines so the text is readable and well structured.
 
-        try:  # This try block attempts to call the local deepseek-coder model through the ChatOllama interface.
-            llm = ChatOllama(model='deepseek-coder:6.7b', temperature=0)  # This line creates a chat client configured to talk to the specific deepseek-coder:6.7b model deterministically.
-            response = llm.invoke(full_prompt)  # This line sends the combined prompt to the model and waits for a single response message.
-            print(f'DEBUG: AI Output: {response.content}')  # This print lets you see the raw AI output in the console so you can debug whether Ollama is actually responding.
-            raw_text = getattr(response, "content", str(response))  # This line extracts the response text, falling back to a string form if there is no .content attribute.
+        try:
+            raw_text = call_openrouter(_OPENROUTER_SYSTEM_PROMPT, full_prompt)
+            print(f"DEBUG: OpenRouter response (first 200 chars): {raw_text[:200]}...")
 
             # The model is asked to return only code, but we still defensively strip out any markdown triple backticks so only raw code remains.
             cleaned_function = _clean_model_code_block(raw_text)
@@ -712,16 +800,16 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                 )
             else:
                 modernized = source_to_improve
-        except Exception as exc:  # This except block catches any errors from contacting the local Ollama server.
-            error_message = f"Ollama call failed in modernizer: {exc!r}"  # This line builds a human-readable description of what went wrong.
-            print(error_message)  # This print displays the failure message in the console for debugging.
-            if state["error_log"]:  # This condition checks whether there is already some error log text recorded.
-                state["error_log"] += f"\n{error_message}"  # This line appends the new error description to the existing log so nothing is lost.
-            else:  # This branch handles the case where the error log was previously empty.
-                state["error_log"] = error_message  # This line initializes the error log with the new error description.
-    else:  # This branch runs if we are not in a C++ context or the Ollama integration is not available.
-        # For non-C++ languages or missing Ollama, we keep a very simple placeholder modernization behavior.
-        modernized = source_to_improve.replace("var ", "auto ")  # This line performs a minimal token replacement, just to show that some transformation happened.
+        except Exception as exc:
+            error_message = f"OpenRouter call failed in modernizer: {exc!r}"
+            print(error_message)
+            if state["error_log"]:
+                state["error_log"] += f"\n{error_message}"
+            else:
+                state["error_log"] = error_message
+    else:
+        # For non-C++ languages, apply a minimal placeholder transformation.
+        modernized = source_to_improve.replace("var ", "auto ")
 
     # Inject any missing #include directives required by the newly written C++ code.
     if is_cpp:
@@ -1011,7 +1099,7 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
     _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # This line gets the project root directory where test.cpp lives.
     _test_cpp_path = os.path.join(_base_dir, "test.cpp")  # This line builds the full path to test.cpp in the project root.
 
-    if not check_ollama_health():
+    if not check_openrouter_health():
         exit(1)
 
     try:  # This try block attempts to read the contents of test.cpp so we can run the full modernization loop on it.

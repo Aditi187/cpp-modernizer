@@ -1,4 +1,6 @@
 langgraph
 fastmcp
-tree-sitter-languages
+tree-sitter
+tree-sitter-cpp
 chromadb
+requests

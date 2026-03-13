@@ -6,13 +6,18 @@ import glob
 import json
 import sys
 import threading
+import time
 from datetime import datetime
 
+import requests
+from dotenv import load_dotenv
 from typing import Optional
 from fastmcp import FastMCP
 
 # Make the project root importable so we can reach core.parser.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+load_dotenv()  # Load .env file from project root before reading env vars
 
 try:
     from core.parser import CppParser
@@ -42,6 +47,97 @@ _ALLOWED_COMPILERS: set[str] = {
     "clang++", "clang",
     "make", "cmake", "ninja",
 }
+
+# ---------------------------------------------------------------------------
+# OpenRouter configuration
+# ---------------------------------------------------------------------------
+
+# Fill in your key here OR export OPENROUTER_API_KEY=sk-or-... in your shell.
+api_key: str = os.environ.get("OPENROUTER_API_KEY", "")
+
+_OPENROUTER_ENDPOINT: str = "https://openrouter.ai/api/v1/chat/completions"
+_OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
+
+_OPENROUTER_SYSTEM_PROMPT: str = (
+    "You are a Master C++20 Developer with access to MCP tools. "
+    "When modernizing C++ code, you MUST provide the ENTIRE file content in the "
+    "`write_code` tool call. Never truncate or use placeholders like // ...rest of code. "
+    "Always use proper C++ syntax. Perform surgical refactors that preserve behavior exactly."
+)
+
+
+def call_openrouter(system_prompt: str, user_prompt: str) -> str:
+    """POST to the OpenRouter chat-completions endpoint with exponential backoff.
+
+    Retries up to 5 times (delays: 1 s, 2 s, 4 s, 8 s, 16 s) on HTTP 429 and
+    5xx responses.  Raises ``RuntimeError`` if all attempts are exhausted.
+    """
+    if not api_key:
+        raise ValueError(
+            "api_key is empty. Set the OPENROUTER_API_KEY environment variable "
+            "or fill in api_key in tools/mcp_server.py."
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": _OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        "max_tokens": 1024,
+        "temperature": 0.2,
+    }
+
+    retry_delays = [1, 2, 4, 8, 16]
+    last_exc: Exception | None = None
+
+    for attempt, delay in enumerate(retry_delays, start=1):
+        try:
+            resp = requests.post(
+                _OPENROUTER_ENDPOINT,
+                headers=headers,
+                json=payload,
+                timeout=120,
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
+            elif resp.status_code == 429:
+                print(
+                    f"⚠️  OpenRouter rate-limited (429). "
+                    f"Retrying in {delay}s… (attempt {attempt}/5)",
+                    file=sys.stderr,
+                )
+            elif 500 <= resp.status_code < 600:
+                print(
+                    f"⚠️  OpenRouter server error {resp.status_code}. "
+                    f"Retrying in {delay}s… (attempt {attempt}/5)",
+                    file=sys.stderr,
+                )
+            else:
+                # Non-retryable client error.
+                raise RuntimeError(
+                    f"OpenRouter returned {resp.status_code}: {resp.text}"
+                )
+        except RuntimeError:
+            raise
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            print(
+                f"⚠️  Network error contacting OpenRouter: {exc}. "
+                f"Retrying in {delay}s… (attempt {attempt}/5)",
+                file=sys.stderr,
+            )
+
+        if attempt < len(retry_delays):
+            time.sleep(delay)
+
+    raise RuntimeError(
+        f"OpenRouter call failed after 5 attempts. Last error: {last_exc!r}"
+    )
 
 
 # ===================================================================
@@ -173,6 +269,11 @@ def write_code(file_path: str, content: str) -> str:
     """Write text content to a file inside the sandboxed project root.
 
     Parent directories are created automatically when they do not exist.
+
+    Truncation guard: if the target file already exists and the incoming content
+    is less than 50 % of the existing file’s length, the write is refused with
+    an error so that partial/truncated LLM responses cannot silently corrupt
+    source files.
     """
     _tool_log("write_code", f"file_path='{file_path}', content_len={len(content)}")
 
@@ -180,6 +281,33 @@ def write_code(file_path: str, content: str) -> str:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
         return _make_result("error", message=str(sandbox_error))
+
+    # ------------------------------------------------------------------
+    # Truncation safety check
+    # ------------------------------------------------------------------
+    if os.path.isfile(absolute_path):
+        try:
+            with open(absolute_path, "r", encoding="utf-8") as _fh:
+                existing_content = _fh.read()
+            existing_len = len(existing_content)
+            incoming_len = len(content)
+            if existing_len > 0 and incoming_len < existing_len * 0.5:
+                pct = incoming_len * 100 // existing_len
+                return _make_result(
+                    "error",
+                    message=(
+                        "ERROR: Potential truncation detected. "
+                        "Please provide the full file content. "
+                        f"Existing file has {existing_len} characters; "
+                        f"incoming content has only {incoming_len} characters "
+                        f"({pct}% of original)."
+                    ),
+                    existing_chars=existing_len,
+                    incoming_chars=incoming_len,
+                    truncation_percent=pct,
+                )
+        except UnicodeDecodeError:
+            pass  # Binary file — skip length check.
 
     directory = os.path.dirname(absolute_path)
     if directory:
