@@ -895,3 +895,60 @@ def extract_functions_from_cpp_file(file_path: str) -> List[Dict[str, Any]]:
     if not isinstance(functions, list):
         return []
     return functions
+
+
+_LEGACY_PATTERN_SPECS: list[tuple[str, str, re.Pattern[str], str]] = [
+    (
+        "char_pointer_array",
+        "critical",
+        re.compile(r"\bchar\s*\*\s*[A-Za-z_][A-Za-z0-9_]*\s*(\[[^\]]*\])"),
+        "char* array usage detected; prefer std::string/std::array/std::span.",
+    ),
+    (
+        "null_macro",
+        "major",
+        re.compile(r"\bNULL\b"),
+        "NULL macro detected; replace with nullptr.",
+    ),
+    (
+        "manual_delete",
+        "critical",
+        re.compile(r"\bdelete\s*(\[\])?\s*[A-Za-z_][A-Za-z0-9_]*\s*;"),
+        "Manual delete detected; prefer std::unique_ptr or stack allocation.",
+    ),
+    (
+        "c_style_cast",
+        "major",
+        re.compile(r"\([^\)\n]+\)\s*[A-Za-z_][A-Za-z0-9_:\->\.\[\]]*"),
+        "Potential C-style cast detected; prefer static_cast/reinterpret_cast.",
+    ),
+]
+
+
+def detect_legacy_patterns(source_text: str) -> List[Dict[str, Any]]:
+    """Detect legacy C/C++ patterns and mark regions for C++23 overhaul."""
+    findings: List[Dict[str, Any]] = []
+    for pattern_id, severity, pattern_re, message in _LEGACY_PATTERN_SPECS:
+        for match in pattern_re.finditer(source_text):
+            start = match.start()
+            line = source_text.count("\n", 0, start) + 1
+            findings.append(
+                {
+                    "pattern": pattern_id,
+                    "severity": severity,
+                    "line": line,
+                    "match": match.group(0),
+                    "message": message,
+                    "tag": "C++23 Overhaul",
+                }
+            )
+
+    findings.sort(key=lambda item: (int(item.get("line", 0)), str(item.get("pattern", ""))))
+    return findings
+
+
+def detect_legacy_patterns_from_cpp_file(file_path: str) -> List[Dict[str, Any]]:
+    path = Path(file_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"C++ file not found: {path}")
+    return detect_legacy_patterns(path.read_text(encoding="utf-8"))

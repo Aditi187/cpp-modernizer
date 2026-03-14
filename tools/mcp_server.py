@@ -5,19 +5,35 @@ import re
 import glob
 import json
 import sys
+# Force UTF-8 output on Windows to prevent UnicodeEncodeError with emoji characters.
+stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding="utf-8", errors="replace")
+stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+if callable(stderr_reconfigure):
+    stderr_reconfigure(encoding="utf-8", errors="replace")
+
 import threading
 import time
 from datetime import datetime
 
-import requests
 from dotenv import load_dotenv
 from typing import Optional
 from fastmcp import FastMCP
 
 # Make the project root importable so we can reach core.parser.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
 
-load_dotenv()  # Load .env file from project root before reading env vars
+load_dotenv(
+    dotenv_path=os.path.join(_PROJECT_ROOT, ".env"),
+    override=True,
+)  # Load .env from project root explicitly and override inherited empty values.
+
+from core.gemini_bridge import (
+    CPP_MODERNIZATION_SYSTEM_PROMPT,
+    GeminiBridge,
+)
 
 try:
     from core.parser import CppParser
@@ -48,96 +64,74 @@ _ALLOWED_COMPILERS: set[str] = {
     "make", "cmake", "ninja",
 }
 
-# ---------------------------------------------------------------------------
-# OpenRouter configuration
-# ---------------------------------------------------------------------------
-
-# Fill in your key here OR export OPENROUTER_API_KEY=sk-or-... in your shell.
-api_key: str = os.environ.get("OPENROUTER_API_KEY", "")
-
-_OPENROUTER_ENDPOINT: str = "https://openrouter.ai/api/v1/chat/completions"
-_OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
-
-_OPENROUTER_SYSTEM_PROMPT: str = (
-    "You are a Master C++20 Developer with access to MCP tools. "
-    "When modernizing C++ code, you MUST provide the ENTIRE file content in the "
-    "`write_code` tool call. Never truncate or use placeholders like // ...rest of code. "
-    "Always use proper C++ syntax. Perform surgical refactors that preserve behavior exactly."
+_MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
+_MODEL_BRIDGE = GeminiBridge.from_env(
+    log_fn=lambda message: print(message, file=sys.stderr)
 )
 
 
-def call_openrouter(system_prompt: str, user_prompt: str) -> str:
-    """POST to the OpenRouter chat-completions endpoint with exponential backoff.
-
-    Retries up to 5 times (delays: 1 s, 2 s, 4 s, 8 s, 16 s) on HTTP 429 and
-    5xx responses.  Raises ``RuntimeError`` if all attempts are exhausted.
-    """
-    if not api_key:
-        raise ValueError(
-            "api_key is empty. Set the OPENROUTER_API_KEY environment variable "
-            "or fill in api_key in tools/mcp_server.py."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": _OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user",   "content": user_prompt},
-        ],
-        "max_tokens": 1024,
-        "temperature": 0.2,
-    }
-
-    retry_delays = [1, 2, 4, 8, 16]
-    last_exc: Exception | None = None
-
-    for attempt, delay in enumerate(retry_delays, start=1):
-        try:
-            resp = requests.post(
-                _OPENROUTER_ENDPOINT,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"]
-            elif resp.status_code == 429:
-                print(
-                    f"⚠️  OpenRouter rate-limited (429). "
-                    f"Retrying in {delay}s… (attempt {attempt}/5)",
-                    file=sys.stderr,
-                )
-            elif 500 <= resp.status_code < 600:
-                print(
-                    f"⚠️  OpenRouter server error {resp.status_code}. "
-                    f"Retrying in {delay}s… (attempt {attempt}/5)",
-                    file=sys.stderr,
-                )
-            else:
-                # Non-retryable client error.
-                raise RuntimeError(
-                    f"OpenRouter returned {resp.status_code}: {resp.text}"
-                )
-        except RuntimeError:
-            raise
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            print(
-                f"⚠️  Network error contacting OpenRouter: {exc}. "
-                f"Retrying in {delay}s… (attempt {attempt}/5)",
-                file=sys.stderr,
-            )
-
-        if attempt < len(retry_delays):
-            time.sleep(delay)
-
-    raise RuntimeError(
-        f"OpenRouter call failed after 5 attempts. Last error: {last_exc!r}"
+def call_model(system_prompt: str, user_prompt: str) -> str:
+    """Call Gemini with shared retry and full-response safeguards."""
+    return _MODEL_BRIDGE.chat_completion(
+        system_prompt,
+        user_prompt,
+        start_new_trace=True,
     )
+
+
+def _read_text_if_exists(path: str) -> str:
+    """Read UTF-8 text from a path, returning an empty string on failure."""
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read()
+    except Exception:
+        return ""
+    return ""
+
+
+def _extract_cpp_inputs_from_command(
+    command_parts: list[str],
+    working_directory_resolved: Optional[str],
+) -> list[dict[str, str]]:
+    """Extract C++ source files from a compiler command and return their content."""
+    sources: list[dict[str, str]] = []
+    seen_paths: set[str] = set()
+    cpp_exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+    base_dir = working_directory_resolved or ALLOWED_ROOT
+
+    for token in command_parts[1:]:
+        if not token or token.startswith("-"):
+            continue
+
+        candidate = token.strip().strip('"').strip("'")
+        if not candidate:
+            continue
+
+        resolved_path = candidate
+        if not os.path.isabs(resolved_path):
+            resolved_path = os.path.normpath(os.path.join(base_dir, resolved_path))
+        else:
+            resolved_path = os.path.normpath(resolved_path)
+
+        if os.path.splitext(resolved_path)[1].lower() not in cpp_exts:
+            continue
+        if resolved_path in seen_paths:
+            continue
+
+        code = _read_text_if_exists(resolved_path)
+        if not code:
+            continue
+
+        seen_paths.add(resolved_path)
+        rel_path = (
+            os.path.relpath(resolved_path, ALLOWED_ROOT)
+            if resolved_path.startswith(ALLOWED_ROOT)
+            else resolved_path
+        )
+        sources.append({"path": rel_path, "code": code})
+
+    return sources
 
 
 # ===================================================================
@@ -294,14 +288,8 @@ def write_code(file_path: str, content: str) -> str:
             if existing_len > 0 and incoming_len < existing_len * 0.5:
                 pct = incoming_len * 100 // existing_len
                 return _make_result(
-                    "error",
-                    message=(
-                        "ERROR: Potential truncation detected. "
-                        "Please provide the full file content. "
-                        f"Existing file has {existing_len} characters; "
-                        f"incoming content has only {incoming_len} characters "
-                        f"({pct}% of original)."
-                    ),
+                    "warning",
+                    message="ERROR: Potential truncation detected. Please provide the full file content.",
                     existing_chars=existing_len,
                     incoming_chars=incoming_len,
                     truncation_percent=pct,
@@ -380,29 +368,70 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
         f"command='{command}', working_directory='{working_directory or '.'}'",
     )
 
+    span = _MODEL_BRIDGE.start_span(
+        "run_compiler",
+        input_payload={
+            "command": command,
+            "working_directory": working_directory or ".",
+        },
+    )
+
     try:
         command_parts = shlex.split(command)
     except ValueError as error:
-        return _make_result("error", message=f"Could not parse the command string: {error!r}")
+        result = _make_result("error", message=f"Could not parse the command string: {error!r}")
+        parsed = json.loads(result)
+        _MODEL_BRIDGE.mark_trace_error("run_compiler parse error", details=parsed)
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+        return result
 
     # --- Compiler whitelist enforcement ---
     rejection = _validate_compiler_binary(command_parts)
     if rejection is not None:
-        return _make_result("error", message=rejection)
+        result = _make_result("error", message=rejection)
+        parsed = json.loads(result)
+        _MODEL_BRIDGE.mark_trace_error("run_compiler validation error", details=parsed)
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+        return result
 
     if working_directory is not None:
         try:
             working_directory_resolved = _ensure_within_allowed_root(working_directory)
         except ValueError as sandbox_error:
-            return _make_result("error", message=str(sandbox_error))
+            result = _make_result("error", message=str(sandbox_error))
+            parsed = json.loads(result)
+            _MODEL_BRIDGE.mark_trace_error("run_compiler sandbox error", details=parsed)
+            _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+            return result
 
         if not os.path.isdir(working_directory_resolved):
-            return _make_result(
+            result = _make_result(
                 "error",
                 message=f"The working directory does not exist or is not a directory: {working_directory_resolved}",
             )
+            parsed = json.loads(result)
+            _MODEL_BRIDGE.mark_trace_error("run_compiler invalid working directory", details=parsed)
+            _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+            return result
     else:
         working_directory_resolved = None
+
+    cpp_inputs = _extract_cpp_inputs_from_command(command_parts, working_directory_resolved)
+    _MODEL_BRIDGE.end_span(
+        span,
+        output_payload={
+            "stage": "compiler-input",
+            "cpp_sources": cpp_inputs,
+        },
+    )
+    span = _MODEL_BRIDGE.start_span(
+        "run_compiler.execution",
+        input_payload={
+            "command": command,
+            "working_directory": working_directory_resolved or ".",
+            "cpp_sources": cpp_inputs,
+        },
+    )
 
     try:
         completed_process = subprocess.run(
@@ -412,26 +441,42 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
             text=True,
         )
     except FileNotFoundError:
-        return _make_result(
+        result = _make_result(
             "error",
             message="The compiler program could not be found. "
                     "Confirm the command name is installed and on your PATH.",
         )
+        parsed = json.loads(result)
+        _MODEL_BRIDGE.mark_trace_error("run_compiler executable missing", details=parsed)
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+        return result
     except Exception as error:
-        return _make_result("error", message=f"Unexpected problem while running the compiler: {error!r}")
+        result = _make_result("error", message=f"Unexpected problem while running the compiler: {error!r}")
+        parsed = json.loads(result)
+        _MODEL_BRIDGE.mark_trace_error("run_compiler execution failed", details=parsed)
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+        return result
 
     exit_code = completed_process.returncode
     stdout = (completed_process.stdout or "").strip()
     stderr = (completed_process.stderr or "").strip()
     hints = _build_location_hints(stdout, stderr)
 
-    return _make_result(
+    result = _make_result(
         "success" if exit_code == 0 else "error",
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
         location_hints=hints,
     )
+    parsed = json.loads(result)
+
+    if parsed.get("status") == "error":
+        _MODEL_BRIDGE.mark_trace_error("run_compiler returned error", details=parsed)
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+    else:
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed)
+    return result
 
 
 @mcp_server.tool()
@@ -1144,42 +1189,67 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         f"file_path='{file_path}', function_fqn='{function_fqn}'",
     )
 
+    span = _MODEL_BRIDGE.start_span(
+        "get_context_for_function",
+        input_payload={
+            "file_path": file_path,
+            "function_fqn": function_fqn,
+            "cpp_code": _read_text_if_exists(file_path),
+        },
+    )
+
     if not _PARSER_AVAILABLE:
-        return _make_result(
+        result = _make_result(
             "error",
             message="CppParser is unavailable. Ensure 'tree-sitter-cpp' is installed.",
         )
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
 
     if not function_fqn or not function_fqn.strip():
-        return _make_result("error", message="function_fqn must be a non-empty fully-qualified function name.")
+        result = _make_result("error", message="function_fqn must be a non-empty fully-qualified function name.")
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
-        return _make_result("error", message=str(sandbox_error))
+        result = _make_result("error", message=str(sandbox_error))
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
 
     if not os.path.isfile(absolute_path):
-        return _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
+        result = _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
+
+    source_text = _read_text_if_exists(absolute_path)
 
     try:
         parser = CppParser()
         project_map = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
     except Exception as exc:
-        return _make_result("error", message=f"Failed to parse C++ file: {exc!r}")
+        result = _make_result("error", message=f"Failed to parse C++ file: {exc!r}")
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
 
     functions: dict = project_map.get("functions") or {}
     if not isinstance(functions, dict) or function_fqn not in functions:
         available = sorted(functions.keys()) if isinstance(functions, dict) else []
-        return _make_result(
+        result = _make_result(
             "error",
             message=f"Function '{function_fqn}' not found in {os.path.basename(absolute_path)}.",
             available_fqns=available,
         )
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
 
     try:
         base_context = parser.get_context_for_function(function_fqn)
     except Exception as exc:
-        return _make_result("error", message=f"Context extraction failed: {exc!r}")
+        result = _make_result("error", message=f"Context extraction failed: {exc!r}")
+        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        return result
 
     fn_meta = functions[function_fqn]
     signature = str(fn_meta.get("signature") or "")
@@ -1244,13 +1314,23 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
 
     context_text = "\n".join(sections)
 
-    return _make_result(
+    result = _make_result(
         "success",
         context=context_text,
         function_fqn=function_fqn,
         header_paths=header_paths,
         required_headers=include_reqs,
     )
+    _MODEL_BRIDGE.end_span(
+        span,
+        output_payload={
+            "status": "success",
+            "function_fqn": function_fqn,
+            "cpp_code": source_text,
+            "context": json.loads(result),
+        },
+    )
+    return result
 
 
 @mcp_server.tool()

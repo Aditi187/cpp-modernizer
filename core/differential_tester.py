@@ -74,14 +74,28 @@ def _parse_peak_memory_kb(stderr_text: str) -> int | None:
 
 
 def resolve_gpp_exe(explicit_path: str | None = None) -> str:
+    return resolve_cpp_compiler(explicit_path)
+
+
+def resolve_cpp_compiler(explicit_path: str | None = None) -> str:
     if explicit_path:
         return explicit_path
-    env_path = os.environ.get("GPP_EXE")
-    if env_path:
-        return env_path
-    which_path = shutil.which("g++")
-    if which_path:
-        return which_path
+
+    env_candidates = [
+        os.environ.get("CXX", "").strip(),
+        os.environ.get("GPP_EXE", "").strip(),
+        os.environ.get("CLANGXX_EXE", "").strip(),
+    ]
+    for candidate in env_candidates:
+        if candidate:
+            return candidate
+
+    preferred_bins = ["g++-13", "clang++-16", "g++", "clang++"]
+    for binary in preferred_bins:
+        found = shutil.which(binary)
+        if found:
+            return found
+
     return "g++"
 
 
@@ -124,7 +138,7 @@ def compile_cpp_source(
         with open(cpp_path, "w", encoding="utf-8") as cpp_file:
             cpp_file.write(code)
 
-        cmd = [compiler, "-std=c++20", "-Wall", cpp_path, "-o", exe_path]
+        cmd = [compiler, "-std=c++23", "-Wall", cpp_path, "-o", exe_path]
         if enable_sanitizers:
             cmd[2:2] = _SANITIZER_COMPILE_FLAGS
 
@@ -209,7 +223,7 @@ def _compile_and_run_cpp(
         enable_sanitizers = False
 
     compile_start = time.time()
-    compile_cmd = [gpp_exe, "-std=c++20", "-Wall", source_path, "-o", exe_path]
+    compile_cmd = [gpp_exe, "-std=c++23", "-Wall", source_path, "-o", exe_path]
     if enable_sanitizers:
         compile_cmd[2:2] = _SANITIZER_COMPILE_FLAGS
 
@@ -303,6 +317,7 @@ def _compile_and_run_cpp(
     return {
         "compile_success": True,
         "run_success": run_success,
+        "exit_code": run_result.returncode,
         "stdout": stdout_text,
         "stderr": stderr_text,
         "compile_time_ms": compile_time_ms,
@@ -462,6 +477,10 @@ def run_differential_test(
 
         norm_orig = _normalize_output(original_result["stdout"])
         norm_mod = _normalize_output(modernized_result["stdout"])
+        norm_orig_err = _normalize_output(original_result.get("stderr", ""))
+        norm_mod_err = _normalize_output(modernized_result.get("stderr", ""))
+        orig_exit = int(original_result.get("exit_code", 0))
+        mod_exit = int(modernized_result.get("exit_code", 0))
 
         # --- Sanitizer & memory analysis on the *modernized* run ---
         mod_sanitizer_findings = modernized_result.get("sanitizer_findings") or []
@@ -473,7 +492,7 @@ def run_differential_test(
         if orig_peak is not None and mod_peak is not None:
             memory_delta_kb = mod_peak - orig_peak  # negative = improvement
 
-        if norm_orig == norm_mod:
+        if norm_orig == norm_mod and norm_orig_err == norm_mod_err and orig_exit == mod_exit:
             # Even if stdout matches, flag failure when sanitizers detected issues.
             return DifferentialTestResult(
                 parity_ok=sanitizer_clean,  # fail if sanitizer found problems
@@ -491,6 +510,8 @@ def run_differential_test(
 
         orig_lines = (norm_orig + "\n").splitlines(keepends=True)
         mod_lines = (norm_mod + "\n").splitlines(keepends=True)
+        orig_err_lines = (norm_orig_err + "\n").splitlines(keepends=True)
+        mod_err_lines = (norm_mod_err + "\n").splitlines(keepends=True)
 
         diff_lines = unified_diff(
             orig_lines,
@@ -498,10 +519,22 @@ def run_differential_test(
             fromfile="Original (test.cpp)",
             tofile="Modernized",
         )
+        err_diff_lines = unified_diff(
+            orig_err_lines,
+            mod_err_lines,
+            fromfile="Original stderr",
+            tofile="Modernized stderr",
+        )
 
         diff_text_parts: list[str] = []
         for line in diff_lines:
             diff_text_parts.append(line)
+        for line in err_diff_lines:
+            diff_text_parts.append(line)
+        if orig_exit != mod_exit:
+            diff_text_parts.append(
+                f"\nExit code mismatch: original={orig_exit}, modernized={mod_exit}\n"
+            )
 
         diff_text = "".join(diff_text_parts)
 

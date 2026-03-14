@@ -1,6 +1,24 @@
+# Core workflow
 langgraph
+
+# MCP tool server
 fastmcp
+
+# C++ parsing
 tree-sitter
 tree-sitter-cpp
+
+# Dependency graph
+networkx
+
+# Vector store (optional, used by ChromaDB-backed tools)
 chromadb
+
+# HTTP client (OpenRouter API)
 requests
+
+# Environment variable loading
+python-dotenv
+
+# Observability
+langfuse

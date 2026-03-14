@@ -5,7 +5,16 @@ Implements a 3-node workflow: Analyzer -> Modernizer -> Verifier (with feedback 
 
 import sys
 import os as os_module
-sys.path.insert(0, os_module.path.dirname(os_module.path.dirname(os_module.path.abspath(__file__))))
+# Force UTF-8 output on Windows to prevent UnicodeEncodeError with emoji characters.
+stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(stdout_reconfigure):
+    stdout_reconfigure(encoding="utf-8", errors="replace")
+stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+if callable(stderr_reconfigure):
+    stderr_reconfigure(encoding="utf-8", errors="replace")
+
+_PROJECT_ROOT = os_module.path.dirname(os_module.path.dirname(os_module.path.abspath(__file__)))
+sys.path.insert(0, _PROJECT_ROOT)
 
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Any, Optional
@@ -13,13 +22,15 @@ import json
 import os
 import re
 import tempfile
-import requests
-import time
 from dotenv import load_dotenv
 
-load_dotenv()  # Load .env file from project root before reading env vars
+load_dotenv(
+    dotenv_path=os_module.path.join(_PROJECT_ROOT, ".env"),
+    override=True,
+)  # Load .env from project root explicitly and override inherited empty values.
 
 from core.parser import extract_functions_from_cpp_file
+from core.parser import detect_legacy_patterns
 from core.graph import (
     DependencyGraph,
     build_analysis_report,
@@ -29,118 +40,58 @@ from core.differential_tester import (
     run_differential_test,
     compile_cpp_source,
 )
+from core.gemini_bridge import (
+    CPP_MODERNIZATION_SYSTEM_PROMPT,
+    GeminiBridge,
+)
+from core.inspect_parser import score_cpp23_compliance
 
 
-# ---------------------------------------------------------------------------
-# OpenRouter configuration
-# ---------------------------------------------------------------------------
+_MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
+_MODEL_BRIDGE = GeminiBridge.from_env(log_fn=print)
+_MIN_CPP23_COMPLIANCE_PERCENT = 40
 
-# Read key from environment; you can also hard-code it here for local testing.
-api_key: str = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_ENDPOINT: str = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
 
-_OPENROUTER_SYSTEM_PROMPT: str = (
-    "You are a Master C++20 Developer with access to MCP tools. "
-    "When modernizing C++ code, you MUST provide the ENTIRE file content in the `write_code` "
-    "tool call. Never truncate or use placeholders like // ...rest of code. "
-    "Never use JavaScript keywords like 'function'. "
-    "Always use proper C++ syntax (for example: 'int main()', 'auto', 'void', correct return "
-    "types, and semicolons). Perform surgical refactors that preserve behavior exactly."
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value in {"1", "true", "yes", "on"}
+
+
+def _read_bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+_STRICT_CPP23_MODE = (
+    _read_bool_env("WORKFLOW_STRICT_MODE", False)
+    or _read_bool_env("CPP23_STRICT_MODE", False)
+)
+_STRICT_CPP23_TARGET_PERCENT = _read_bounded_int_env(
+    "CPP23_STRICT_TARGET_PERCENT",
+    70,
+    0,
+    100,
 )
 
 
-def call_openrouter(system_prompt: str, user_prompt: str) -> str:
-    """Call the OpenRouter chat-completions endpoint with exponential backoff.
-
-    Retries up to 5 times (delays: 1s, 2s, 4s, 8s, 16s) on 429 and 5xx errors.
-    Raises RuntimeError if all attempts fail.
-    """
-    if not api_key:
-        raise ValueError(
-            "api_key is empty. Please set your OpenRouter API key in agents/workflow.py."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_tokens": 1024,
-        "temperature": 0.2,
-    }
-
-    retry_delays = [1, 2, 4, 8, 16]
-    last_exc: Exception | None = None
-
-    for attempt, delay in enumerate(retry_delays, start=1):
-        try:
-            response = requests.post(
-                OPENROUTER_ENDPOINT,
-                headers=headers,
-                json=payload,
-                timeout=120,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                return data["choices"][0]["message"]["content"]
-            elif response.status_code == 429:
-                print(
-                    f"⚠️  OpenRouter rate limited (429). "
-                    f"Retrying in {delay}s... (attempt {attempt}/5)"
-                )
-            elif 500 <= response.status_code < 600:
-                print(
-                    f"⚠️  OpenRouter server error {response.status_code}. "
-                    f"Retrying in {delay}s... (attempt {attempt}/5)"
-                )
-            else:
-                # Non-retryable client errors (4xx other than 429).
-                raise RuntimeError(
-                    f"OpenRouter returned {response.status_code}: {response.text}"
-                )
-        except RuntimeError:
-            raise
-        except requests.exceptions.RequestException as exc:
-            last_exc = exc
-            print(
-                f"⚠️  Network error contacting OpenRouter: {exc}. "
-                f"Retrying in {delay}s... (attempt {attempt}/5)"
-            )
-
-        if attempt < len(retry_delays):
-            time.sleep(delay)
-
-    raise RuntimeError(
-        f"OpenRouter call failed after 5 attempts. Last error: {last_exc!r}"
-    )
+def call_model(system_prompt: str, user_prompt: str) -> str:
+    """Call Gemini with shared retry and full-response safeguards."""
+    return _MODEL_BRIDGE.chat_completion(system_prompt, user_prompt)
 
 
-def check_openrouter_health() -> bool:
-    """Verify the OpenRouter API key is set and the endpoint is reachable."""
-    if not api_key:
-        print("❌ api_key is empty. Please fill in your OpenRouter API key in agents/workflow.py.")
-        return False
-    try:
-        response = requests.get(
-            "https://openrouter.ai/api/v1/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-            timeout=10,
-        )
-        if response.status_code == 200:
-            print("✅ OPENROUTER CONNECTION VERIFIED")
-            return True
-        else:
-            print(f"❌ OpenRouter returned status {response.status_code}. Check your API key.")
-            return False
-    except requests.exceptions.RequestException as exc:
-        print(f"❌ Could not reach OpenRouter: {exc}")
-        return False
+def check_model_health() -> bool:
+    """Verify the Gemini API key is set and the endpoint is reachable."""
+    is_healthy, message = _MODEL_BRIDGE.check_health()
+    print(("✅ " if is_healthy else "❌ ") + message)
+    return is_healthy
 
 
 def _parse_functions_from_source(source_code: str) -> list[dict[str, Any]]:
@@ -251,6 +202,43 @@ def _extract_function_text_from_code(source_code: str, function_name: str) -> st
             code_bytes = source_code.encode("utf-8")
             return code_bytes[start_byte:end_byte].decode("utf-8", errors="replace")
     return ""
+
+
+def _remove_functions_by_name(source_code: str, function_names: set[str]) -> str:
+    """Remove full function definitions by name using parser byte spans."""
+    if not function_names:
+        return source_code
+
+    source_bytes = source_code.encode("utf-8")
+    functions_info = _parse_functions_from_source(source_code)
+    spans_to_remove: list[tuple[int, int]] = []
+
+    for fn in functions_info:
+        fn_name = str(fn.get("name") or "")
+        if fn_name not in function_names:
+            continue
+        start_byte = fn.get("start_byte")
+        end_byte = fn.get("end_byte")
+        if isinstance(start_byte, int) and isinstance(end_byte, int) and 0 <= start_byte <= end_byte <= len(source_bytes):
+            spans_to_remove.append((start_byte, end_byte))
+
+    if not spans_to_remove:
+        return source_code
+
+    spans_to_remove.sort(key=lambda pair: pair[0])
+    new_chunks: list[bytes] = []
+    cursor = 0
+    for start_byte, end_byte in spans_to_remove:
+        if start_byte < cursor:
+            continue
+        if start_byte > cursor:
+            new_chunks.append(source_bytes[cursor:start_byte])
+        cursor = end_byte
+
+    if cursor < len(source_bytes):
+        new_chunks.append(source_bytes[cursor:])
+
+    return b"".join(new_chunks).decode("utf-8", errors="replace")
 
 
 class IncludeManager:
@@ -455,6 +443,10 @@ class ModernizationState(TypedDict):
     partial_success: bool  # This field records whether the workflow finished with only a subset of functions modernized.
     last_working_code: str  # This field stores the last code snapshot that successfully compiled.
     current_target_function: str  # This field stores the function being surgically modernized in the current iteration.
+    source_file: str  # Path to the original source file; used to derive the output file path.
+    output_file_path: str  # Explicit output path; when non-empty it overrides the auto-derived path.
+    legacy_findings: list[dict[str, Any]]  # Static-analysis tags for legacy C/C++ regions needing C++23 overhaul.
+    compliance_report: dict[str, Any]  # C++23 compliance score details for the current modernized candidate.
 
 
 def analyzer_node(state: ModernizationState) -> ModernizationState:
@@ -471,7 +463,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     print(f"Language: {state['language']}")  # This print shows which language label the workflow thinks it is processing.
     print(f"Input Code (first 200 chars):\n{state['code'][:200]}...")  # This print gives you a quick peek at the beginning of the input code for context.
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether the language label indicates C++, which is when we want to use the Tree-sitter parser.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether the language label indicates C++, which is when we want to use the Tree-sitter parser.
 
     functions_info = []  # type: ignore[var-annotated]  # This variable will hold the list of functions discovered by the parser, if any.
     dependency_map: dict[str, list[str]] = {}  # This dictionary will map each function name to the list of functions it calls.
@@ -480,6 +472,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     cycles: list[list[str]] = []  # This list will store any detected circular recursion cycles.
     analysis_report: str = ""  # This string will hold a concise human-readable summary of the code structure.
     call_graph_data: dict[str, Any] = {}  # This dictionary will store a JSON-serializable view of the call graph.
+    legacy_findings: list[dict[str, Any]] = []
 
     if is_cpp:  # This condition ensures we only run the C++ parser when we are actually working with C++ code.
         code_value = state["code"]  # This line saves the code field to a shorter variable name, which may be either text or a file path.
@@ -502,6 +495,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
 
         try:  # This try block attempts to run the parser on the chosen C++ file path and build a dependency graph.
             functions_info = extract_functions_from_cpp_file(cpp_path)  # type: ignore[arg-type]  # This call extracts function definitions, calls, and byte spans.
+            legacy_findings = detect_legacy_patterns(state["code"])
 
             dep_graph = DependencyGraph(functions_info)  # This line constructs a DependencyGraph object from the function metadata.
             dependency_map = dep_graph.dependency_map  # This line reads the caller -> callees adjacency list.
@@ -531,6 +525,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
         "cycles": cycles,  # This entry records any circular recursion cycles in the call graph.
         "analysis_report": analysis_report,  # This entry stores a concise human-readable description of the code structure.
         "parser_error": parser_error,  # This entry stores any error message from the parser, or an empty string if everything went fine.
+        "legacy_findings": legacy_findings,
     }  # This closing brace ends the analysis dictionary.
 
     state["analysis"] = json.dumps(analysis, indent=2, sort_keys=True)  # This line converts the analysis dictionary into a stable, human-readable JSON string and stores it in the state.
@@ -539,6 +534,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     state["impact_map"] = dependency_map  # This line aliases the dependency_map as impact_map to emphasize its use in prompts.
     state["orphans"] = orphans  # This line stores the list of orphan functions so downstream nodes can choose to prune them.
     state["analysis_report"] = analysis_report  # This line stores the human-readable report so it can be included in prompts if desired.
+    state["legacy_findings"] = legacy_findings
 
     if dependency_map:
         state["modernization_order"] = get_modernization_order(dependency_map)
@@ -564,14 +560,25 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
     """
     print("\n✂️  PRUNER NODE")  # This print marks the start of the pruning step in the console.
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether we are working with C++ code.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ code.
     if not is_cpp:  # This condition skips pruning for non-C++ languages.
         print("Pruner: skipping (non-C++ language).")
         return state  # This return leaves the state unchanged.
 
-    if not state.get("analysis"):  # This condition ensures that we only run if the deep analyzer produced analysis.
-        print("Pruner: no analysis found, skipping pruning.")
-        return state  # This return leaves the state unchanged.
+    if not state.get("analysis"):
+        try:
+            pre_functions = _parse_functions_from_source(state["code"])
+            pre_graph = DependencyGraph(pre_functions)
+            pre_orphans = list(pre_graph.analyze().get("orphans", []))
+            pre_analysis = {
+                "functions": pre_functions,
+                "orphans": pre_orphans,
+            }
+            state["analysis"] = json.dumps(pre_analysis)
+            state["orphans"] = pre_orphans
+        except Exception:
+            print("Pruner: no analysis found and pre-analysis failed, skipping pruning.")
+            return state
 
     try:
         analysis_obj = json.loads(state["analysis"])  # This line parses the JSON analysis string into a Python dictionary.
@@ -643,6 +650,7 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
     pruned_code = _prune_dead_includes(pruned_code, sorted(orphans_to_prune))
 
     state["code"] = pruned_code  # This line updates the state with the pruned source code so the modernizer works on a smaller, focused input.
+    state["last_working_code"] = pruned_code  # Keep subsequent passes anchored to the pruned baseline so removed orphans do not come back.
 
     # Remove pruned functions from the modernization order so the modernizer
     # does not attempt to re-add them.
@@ -676,7 +684,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
     print(f"Source Code To Modernize (first 200 chars):\n{source_to_improve[:200]}...")  # This print shows the first part of the code that will be sent to the model.
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether we are working with C++ so we know whether to ask for C++20 modernization.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ so we know whether to ask for C++23 modernization.
 
     modernized = source_to_improve  # This line initializes the modernized code to the source as a safe default in case the model call fails.
     state["current_target_function"] = ""
@@ -757,51 +765,74 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                     f"{state['error_log']}"
                 )
 
+        if state.get("legacy_findings"):
+            legacy_lines = []
+            for finding in state.get("legacy_findings", []):
+                line = finding.get("line", "?")
+                message = finding.get("message", "")
+                match = finding.get("match", "")
+                legacy_lines.append(f"- line {line}: {match} -> {message}")
+            if legacy_lines:
+                prompt_parts.append(
+                    "Legacy regions tagged for C++23 Overhaul:\n" + "\n".join(legacy_lines)
+                )
+
         prompt_parts.append(
-            "Current function source to modernize:\n"
+            "Current full C++ file to modernize:\n"
             "```cpp\n"
-            f"{current_function_source}\n"
+            f"{source_to_improve}\n"
             "```\n\n"
-            "Return ONLY the full updated code for this single function. "
-            "Do not return the whole file. Do not add explanation text."
+            f"Orphan functions that MUST NOT exist in final output: {', '.join([name for name in (state.get('orphans') or []) if name != 'main']) or 'none'}.\n"
+            "C++23 target priorities (apply when behavior is preserved):\n"
+            "1) Error handling: std::expected/std::optional\n"
+            "2) I/O and formatting: std::print/std::format\n"
+            "3) Data handling: std::span/std::mdspan\n"
+            "4) Iteration: std::ranges/views\n"
+            "5) Memory: std::unique_ptr and stack allocation\n"
+            "You MUST return the ENTIRE updated C++ file content. "
+            "Do not return a single function. Do not truncate. Do not use placeholders. "
+            "Do not add explanation text outside code. Keep comments minimal and preserve program behavior exactly. "
+            "If generation would exceed limits, end at a logical boundary and explicitly include '// CONTINUATION REQUIRED'."
         )
 
         full_prompt = "\n\n".join(prompt_parts)  # This line joins all prompt sections together with blank lines so the text is readable and well structured.
 
         try:
-            raw_text = call_openrouter(_OPENROUTER_SYSTEM_PROMPT, full_prompt)
-            print(f"DEBUG: OpenRouter response (first 200 chars): {raw_text[:200]}...")
+            raw_text = call_model(_MODEL_SYSTEM_PROMPT, full_prompt)
+            print(f"DEBUG: Gemini response (first 200 chars): {raw_text[:200]}...")
 
             # The model is asked to return only code, but we still defensively strip out any markdown triple backticks so only raw code remains.
-            cleaned_function = _clean_model_code_block(raw_text)
+            cleaned_candidate = _clean_model_code_block(raw_text)
 
-            # The model often returns the whole file instead of just the
-            # target function.  Try to extract only the target function
-            # from the cleaned output to avoid duplicate definitions.
-            extracted = _extract_function_text_from_code(
-                cleaned_function, current_function_name
+            # Enforce full-file responses: reject suspiciously short snippets.
+            source_len = len(source_to_improve.strip())
+            candidate_len = len(cleaned_candidate.strip())
+            min_required = int(source_len * 0.6)
+            looks_like_whole_file = (
+                candidate_len >= max(200, min_required)
+                and "int main(" in cleaned_candidate
             )
-            if extracted:
-                cleaned_function = extracted
 
-            target_start = current_function_info.get("start_byte")
-            target_end = current_function_info.get("end_byte")
-            if (
-                cleaned_function
-                and isinstance(target_start, int)
-                and isinstance(target_end, int)
-                and 0 <= target_start <= target_end <= len(source_to_improve.encode("utf-8"))
-            ):
-                modernized = _replace_function_by_span(
-                    source_to_improve,
-                    target_start,
-                    target_end,
-                    cleaned_function,
-                )
+            if looks_like_whole_file:
+                modernized = cleaned_candidate
+
+                # Re-apply orphan pruning guard to prevent the model from re-introducing dead functions.
+                orphan_names = {name for name in (state.get("orphans") or []) if name != "main"}
+                if orphan_names:
+                    modernized = _remove_functions_by_name(modernized, orphan_names)
             else:
                 modernized = source_to_improve
+                warning = (
+                    "Model response looked truncated or function-only; "
+                    "full-file response required."
+                )
+                print(f"⚠️  {warning}")
+                if state["error_log"]:
+                    state["error_log"] += f"\n{warning}"
+                else:
+                    state["error_log"] = warning
         except Exception as exc:
-            error_message = f"OpenRouter call failed in modernizer: {exc!r}"
+            error_message = f"Gemini call failed in modernizer: {exc!r}"
             print(error_message)
             if state["error_log"]:
                 state["error_log"] += f"\n{error_message}"
@@ -833,7 +864,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
     code_to_verify = state["modernized_code"]  # This line uses only the modernized_code field, because we want to compile exactly what the modernizer produced.
 
     if not code_to_verify.strip():  # This condition checks if the AI returned no code (empty or whitespace-only); if so, we stop the workflow entirely.
-        message = "CRITICAL: Ollama returned no code. Check if the model is loaded in RAM."  # This line sets the exact critical error message requested for empty AI output.
+        message = "CRITICAL: Gemini returned no code. Check your model selection, API key, and max token settings."  # This line sets a precise failure message for empty AI output.
         print(message)  # This print makes the critical condition visible in the console so you know why the workflow is stopping.
         verification_result = {  # This dictionary records a failure result so the workflow can finish without calling the compiler.
             "success": False,  # This field marks the verification as a failure because there was nothing to compile.
@@ -856,6 +887,37 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         print("✅ Verification PASSED")  # This print confirms in the console that the modernized code compiled successfully.
         state["error_log"] = ""  # This line clears the error log because there are no compiler errors to feed back into the model.
         state["last_working_code"] = state["modernized_code"]
+        state["compliance_report"] = score_cpp23_compliance(state["modernized_code"])
+        compliance_percent = int(state["compliance_report"].get("percent", 0))
+        print(f"C++23 Compliance Score: {compliance_percent}%")
+
+        required_percent = (
+            _STRICT_CPP23_TARGET_PERCENT
+            if _STRICT_CPP23_MODE
+            else _MIN_CPP23_COMPLIANCE_PERCENT
+        )
+        if compliance_percent < required_percent:
+            weak_rules = [
+                detail.get("id", "unknown")
+                for detail in state["compliance_report"].get("details", [])
+                if int(detail.get("score", 0)) < int(detail.get("max_score", 0))
+            ]
+            mode_label = "strict" if _STRICT_CPP23_MODE else "soft"
+            guidance = (
+                f"C++23 compliance score below {mode_label} threshold "
+                f"({required_percent}%). Missing/weak areas: {', '.join(weak_rules) or 'unknown'}."
+            )
+            state["error_log"] = guidance
+            state["verification_result"] = {
+                "success": False,
+                "errors": [guidance],
+                "warnings": [],
+                "compilation_time_ms": verification_result.get("compilation_time_ms", 0),
+                "raw_stdout": verification_result.get("raw_stdout", ""),
+                "raw_stderr": verification_result.get("raw_stderr", ""),
+            }
+            print(f"⚠️  Verification downgraded: {guidance}")
+            return state
 
         target_function = state.get("current_target_function") or ""
         if target_function:
@@ -871,6 +933,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         state["current_function_index"] = int(state.get("current_function_index", 0)) + 1
     else:  # This branch handles the case where g++ returned at least one error.
         print("❌ Verification FAILED")  # This print reports in the console that compilation failed.
+        state["compliance_report"] = {}
         raw_stderr = verification_result.get("raw_stderr", "")
         errors_list = verification_result.get("errors") or []
         combined_error = raw_stderr or "\n".join(errors_list)
@@ -910,7 +973,7 @@ def tester_node(state: ModernizationState) -> ModernizationState:
     state["is_functionally_equivalent"] = True  # This line assumes functional equivalence until the tester proves otherwise.
     state["diff_output"] = ""  # This line clears any previous diff output.
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20"}  # This line checks whether we are working with C++ code.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ code.
     if not is_cpp:
         print("Tester: skipping (non-C++ language).")
         return state  # This return leaves the state unchanged for non-C++ code.
@@ -956,6 +1019,14 @@ def tester_node(state: ModernizationState) -> ModernizationState:
     state["error_log"] = diff_text  # This line mirrors the diff into error_log for backward-compatible prompts and logging.
 
     return state  # This return passes the updated state (including parity info) back into the LangGraph router.
+
+
+def verify_node(state: ModernizationState) -> ModernizationState:
+    """Combined verification stage: compile, then run behavioral differential test."""
+    compiled_state = verifier_node(state)
+    if not compiled_state.get("verification_result", {}).get("success"):
+        return compiled_state
+    return tester_node(compiled_state)
 
 
 def surgical_router(state: ModernizationState) -> str:
@@ -1017,35 +1088,33 @@ def build_workflow():
     workflow = StateGraph(ModernizationState)
     
     # Add nodes
-    workflow.add_node("analyzer", analyzer_node)
-    workflow.add_node("pruner", pruner_node)
-    workflow.add_node("modernizer", modernizer_node)
-    workflow.add_node("verifier", verifier_node)
-    workflow.add_node("tester", tester_node)
+    workflow.add_node("prune", pruner_node)
+    workflow.add_node("analyze", analyzer_node)
+    workflow.add_node("transform", modernizer_node)
+    workflow.add_node("verify", verify_node)
     
     # Define edges for the graph-first, self-healing pipeline
-    workflow.add_edge("analyzer", "pruner")
-    workflow.add_edge("pruner", "modernizer")
-    workflow.add_edge("modernizer", "verifier")
-    workflow.add_edge("verifier", "tester")
+    workflow.add_edge("prune", "analyze")
+    workflow.add_edge("analyze", "transform")
+    workflow.add_edge("transform", "verify")
     
     # Conditional edge from tester based on compilation and parity results
     workflow.add_conditional_edges(
-        "tester",
+        "verify",
         surgical_router,
         {
-            "modernizer": "modernizer",
+            "modernizer": "transform",
             "end": END
         }
     )
     
     # Set entry point
-    workflow.set_entry_point("analyzer")
+    workflow.set_entry_point("prune")
     
     return workflow.compile()
 
 
-def run_modernization_workflow(code: str, language: str = "python"):
+def run_modernization_workflow(code: str, language: str = "c++23", source_file: str = "", output_file_path: str = ""):
     """
     Executes the modernization workflow with provided code
     """
@@ -1077,11 +1146,52 @@ def run_modernization_workflow(code: str, language: str = "python"):
         partial_success=False,
         last_working_code=code,
         current_target_function="",
+        source_file=source_file,
+        output_file_path=output_file_path,
+        legacy_findings=[],
+        compliance_report={},
     )
     
     # Build and run the workflow
+    _MODEL_BRIDGE.start_modernization_trace(
+        input_payload={
+            "operation": "workflow_run",
+            "language": language,
+            "source_file": source_file,
+            "source_length": len(code),
+        }
+    )
+
     graph = build_workflow()
     final_state = graph.invoke(initial_state)
+
+    if _STRICT_CPP23_MODE:
+        compliance_percent = int(final_state.get("compliance_report", {}).get("percent", 0))
+        strict_ok = (
+            bool(final_state.get("verification_result", {}).get("success"))
+            and bool(final_state.get("is_parity_passed", False))
+            and compliance_percent >= _STRICT_CPP23_TARGET_PERCENT
+        )
+        if not strict_ok:
+            strict_message = (
+                "STRICT MODE FAILURE: final output did not satisfy required C++23 compliance target "
+                f"({_STRICT_CPP23_TARGET_PERCENT}%). Final score: {compliance_percent}%."
+            )
+            final_state["verification_result"] = {
+                "success": False,
+                "errors": [strict_message],
+                "warnings": [],
+                "compilation_time_ms": final_state.get("verification_result", {}).get("compilation_time_ms", 0),
+                "raw_stdout": final_state.get("verification_result", {}).get("raw_stdout", ""),
+                "raw_stderr": final_state.get("verification_result", {}).get("raw_stderr", ""),
+            }
+            final_state["error_log"] = strict_message
+            print(f"❌ {strict_message}")
+        else:
+            print(
+                "✅ STRICT MODE PASSED: "
+                f"C++23 compliance {compliance_percent}% >= {_STRICT_CPP23_TARGET_PERCENT}%"
+            )
     
     # Print final results
     print("\n" + "=" * 60)
@@ -1091,7 +1201,30 @@ def run_modernization_workflow(code: str, language: str = "python"):
     print(f"Total Attempts: {final_state['attempt_count']}")
     print(f"Verification Success: {final_state['verification_result'].get('success')}")
     print(f"\nFinal Modernized Code:\n{final_state['modernized_code']}")
-    
+
+    # ------------------------------------------------------------------
+    # Save modernized code to a separate output file
+    # ------------------------------------------------------------------
+    output_path: Optional[str] = final_state.get("output_file_path")
+    if not output_path:
+        # Derive output path from source_file in state, or fall back to cwd.
+        source_path: str = final_state.get("source_file", "") or ""
+        if source_path:
+            base, _ext = os.path.splitext(source_path)
+            output_path = f"{base}_modernized.cpp"
+        else:
+            output_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "output_modernized.cpp",
+            )
+
+    try:
+        with open(output_path, "w", encoding="utf-8") as _out:
+            _out.write(final_state["modernized_code"])
+        print(f"\n💾 Modernized code saved to: {output_path}")
+    except OSError as _save_err:
+        print(f"\n⚠️  Could not save output file: {_save_err}")
+
     return final_state
 
 
@@ -1099,7 +1232,7 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
     _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # This line gets the project root directory where test.cpp lives.
     _test_cpp_path = os.path.join(_base_dir, "test.cpp")  # This line builds the full path to test.cpp in the project root.
 
-    if not check_openrouter_health():
+    if not check_model_health():
         exit(1)
 
     try:  # This try block attempts to read the contents of test.cpp so we can run the full modernization loop on it.
@@ -1110,4 +1243,6 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
         print("❌ test.cpp not found at", _test_cpp_path)  # This print tells the user where the script looked for the file.
         exit(1)  
         
-    result = run_modernization_workflow(cpp_code, language="cpp")  # This line invokes the full workflow (analyzer -> modernizer -> verifier with retries) on the loaded code.
+    result = run_modernization_workflow(cpp_code, language="c++23", source_file=_test_cpp_path)  # This line invokes the full workflow (prune -> analyze -> transform -> verify with retries) on the loaded code.
+    if not bool(result.get("verification_result", {}).get("success")):
+        exit(2)
