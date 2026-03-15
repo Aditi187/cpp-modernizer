@@ -1,49 +1,46 @@
-#include <iostream>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-/**
- * Legacy Discount Calculator
- * This function is a leaf dependency.
- */
-float applyDiscount(float price, float percent) {
-    return price * (1.0f - (percent / 100.0f));
-}
+// Global pointer - a nightmare for thread safety and modernization
+char* GLOBAL_LOG_BUFFER = NULL;
 
-/**
- * Main Processing Logic
- * Uses raw pointers and C-style iteration.
- */
-void processOrders() {
-    int count = 3;
-    float* prices = new float[3]; // Manual allocation
-    prices[0] = 100.0;
-    prices[1] = 200.0;
-    prices[2] = 300.0;
+typedef struct {
+    int id;
+    char* raw_data;
+    size_t len;
+} LegacyRecord;
 
-    printf("Processing %d items...\n", count);
+// Hard to modernize: returns raw pointer, uses malloc, and return codes for errors
+int load_record(LegacyRecord** out_rec, int id) {
+    if (id <= 0) return -1; // Error code
+
+    *out_rec = (LegacyRecord*)malloc(sizeof(LegacyRecord));
+    (*out_rec)->id = id;
     
-    float total = 0;
-    for (int i = 0; i < count; i++) {
-        // Nested dependency call
-        float finalPrice = applyDiscount(prices[i], 10.0f);
-        total += finalPrice;
-    }
-
-    std::cout << "Total after 10% discount: " << total << std::endl;
-
-    delete[] prices; // Manual deallocation
+    const char* dummy = "DEVICE_DATA_STREAM_0xCF";
+    (*out_rec)->len = strlen(dummy);
+    (*out_rec)->raw_data = (char*)malloc((*out_rec)->len + 1);
+    strcpy((*out_rec)->raw_data, dummy);
+    
+    return 0; // Success code
 }
 
-/**
- * ORPHAN FUNCTION
- * This is never called by main or processOrders.
- * The Pruner Node should remove this.
- */
-void unusedLogic() {
-    std::cout << "This should be pruned!" << std::endl;
+void process_data() {
+    LegacyRecord* rec = NULL;
+    // Pointer to pointer logic is a great test for std::expected and smart pointers
+    if (load_record(&rec, 42) == 0) {
+        printf("Processing Record %d: %s\n", rec->id, rec->raw_data);
+        
+        // Manual cleanup often forgotten by lazy AI
+        free(rec->raw_data);
+        free(rec);
+    } else {
+        printf("Failed to load record.\n");
+    }
 }
 
 int main() {
-    processOrders();
+    process_data();
     return 0;
 }

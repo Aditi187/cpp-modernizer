@@ -213,25 +213,24 @@ def _compile_and_run_cpp(
     exe_name: str,
     input_data: str | None = None,
     enable_sanitizers: bool = True,
+    compile_timeout_seconds: int = 10,
+    run_timeout_seconds: int = 10,
 ) -> dict:
+    exe_path = os.path.join(tmp_dir, exe_name)
     _verify_compiler(gpp_exe)
 
-    exe_path = os.path.join(tmp_dir, exe_name)
-
-    # Auto-disable sanitizers on Windows/MinGW (libs not available).
     if enable_sanitizers and not _sanitizers_available():
         enable_sanitizers = False
+
+    sanitizer_env = dict(os.environ)
+    if enable_sanitizers:
+        sanitizer_env["ASAN_OPTIONS"] = "detect_leaks=1:print_stats=1:halt_on_error=0"
+        sanitizer_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=0"
 
     compile_start = time.time()
     compile_cmd = [gpp_exe, "-std=c++23", "-Wall", source_path, "-o", exe_path]
     if enable_sanitizers:
         compile_cmd[2:2] = _SANITIZER_COMPILE_FLAGS
-
-    # Tell ASan to report leaks and print stats so we can extract peak memory.
-    sanitizer_env = dict(os.environ)
-    if enable_sanitizers:
-        sanitizer_env["ASAN_OPTIONS"] = "detect_leaks=1:print_stats=1:halt_on_error=0"
-        sanitizer_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=0"
 
     try:
         compile_result = subprocess.run(
@@ -239,17 +238,22 @@ def _compile_and_run_cpp(
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=10,
+            timeout=compile_timeout_seconds,
             env=sanitizer_env,
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         return {
             "compile_success": False,
             "run_success": False,
             "stdout": "",
-            "stderr": f"Compilation timed out: {exc!r}",
+            "stderr": f"Compilation timed out after {compile_timeout_seconds} seconds.",
             "compile_time_ms": int((time.time() - compile_start) * 1000),
             "run_time_ms": 0,
+            "exit_code": None,
+            "sanitizer_findings": [],
+            "peak_memory_kb": None,
+            "timed_out": True,
+            "crash_reason": "",
         }
     except Exception as exc:
         return {
@@ -259,41 +263,58 @@ def _compile_and_run_cpp(
             "stderr": f"Compilation failed: {exc!r}",
             "compile_time_ms": int((time.time() - compile_start) * 1000),
             "run_time_ms": 0,
+            "exit_code": None,
+            "sanitizer_findings": [],
+            "peak_memory_kb": None,
+            "timed_out": False,
+            "crash_reason": "",
         }
 
     compile_time_ms = int((time.time() - compile_start) * 1000)
-
     if compile_result.returncode != 0:
-        stderr_text = (compile_result.stderr or "").strip()
         return {
             "compile_success": False,
             "run_success": False,
             "stdout": (compile_result.stdout or "").strip(),
-            "stderr": stderr_text,
+            "stderr": (compile_result.stderr or "").strip(),
             "compile_time_ms": compile_time_ms,
             "run_time_ms": 0,
+            "exit_code": None,
+            "sanitizer_findings": [],
+            "peak_memory_kb": None,
+            "timed_out": False,
+            "crash_reason": "",
         }
 
     run_start = time.time()
+    use_time_v = platform.system() != "Windows" and os.path.isfile("/usr/bin/time")
+    run_cmd = [exe_path]
+    if use_time_v:
+        run_cmd = ["/usr/bin/time", "-v", exe_path]
 
     try:
         run_result = subprocess.run(
-            [exe_path],
+            run_cmd,
             input=input_data if input_data is not None else None,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=10,
+            timeout=run_timeout_seconds,
             env=sanitizer_env,
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         return {
             "compile_success": True,
             "run_success": False,
             "stdout": "",
-            "stderr": f"Execution timed out: {exc!r}",
+            "stderr": f"Execution timed out after {run_timeout_seconds} seconds.",
             "compile_time_ms": compile_time_ms,
             "run_time_ms": int((time.time() - run_start) * 1000),
+            "exit_code": None,
+            "sanitizer_findings": [],
+            "peak_memory_kb": None,
+            "timed_out": True,
+            "crash_reason": "timeout",
         }
     except Exception as exc:
         return {
@@ -303,27 +324,53 @@ def _compile_and_run_cpp(
             "stderr": f"Execution failed: {exc!r}",
             "compile_time_ms": compile_time_ms,
             "run_time_ms": int((time.time() - run_start) * 1000),
+            "exit_code": None,
+            "sanitizer_findings": [],
+            "peak_memory_kb": None,
+            "timed_out": False,
+            "crash_reason": "execution_error",
         }
 
     run_time_ms = int((time.time() - run_start) * 1000)
-
     stdout_text = (run_result.stdout or "").strip()
     stderr_text = (run_result.stderr or "").strip()
-    run_success = run_result.returncode == 0
+
+    crash_reason = ""
+    exit_code = int(run_result.returncode)
+    if exit_code < 0:
+        signal_name = {
+            6: "abort()",
+            4: "illegal instruction",
+            8: "floating point exception",
+            11: "segmentation fault",
+        }.get(-exit_code, f"signal {-exit_code}")
+        crash_reason = f"Process crashed with {signal_name}."
+    elif exit_code in {132, 134, 136, 139}:
+        crash_reason = {
+            132: "Process crashed: illegal instruction.",
+            134: "Process crashed: abort().",
+            136: "Process crashed: floating point exception.",
+            139: "Process crashed: segmentation fault.",
+        }[exit_code]
+    elif re.search(r"segmentation fault|illegal instruction|floating point exception|aborted", stderr_text, re.IGNORECASE):
+        crash_reason = "Process crashed (detected from stderr)."
 
     sanitizer_findings = _detect_sanitizer_errors(stderr_text)
     peak_memory_kb = _parse_peak_memory_kb(stderr_text)
+    run_success = exit_code == 0 and not crash_reason
 
     return {
         "compile_success": True,
         "run_success": run_success,
-        "exit_code": run_result.returncode,
+        "exit_code": exit_code,
         "stdout": stdout_text,
         "stderr": stderr_text,
         "compile_time_ms": compile_time_ms,
         "run_time_ms": run_time_ms,
         "sanitizer_findings": sanitizer_findings,
         "peak_memory_kb": peak_memory_kb,
+        "timed_out": False,
+        "crash_reason": crash_reason,
     }
 
 
@@ -353,6 +400,9 @@ class DifferentialTestResult:
     sanitizer_clean: bool = True
     sanitizer_findings: list[str] | None = None
     memory_delta_kb: int | None = None
+    test_cases_run: int = 0
+    failed_case_index: int | None = None
+    performance_delta_ms: int | None = None
 
 
 def run_differential_test(
@@ -360,6 +410,9 @@ def run_differential_test(
     modernized_code: str,
     gpp_exe: str | None = None,
     input_data: str | None = None,
+    input_cases: list[str] | None = None,
+    compile_timeout_seconds: int = 10,
+    run_timeout_seconds: int = 10,
 ) -> dict:
     compiler = resolve_gpp_exe(gpp_exe)
     _verify_compiler(compiler)
@@ -408,7 +461,12 @@ def run_differential_test(
                 "run_time_ms": 0,
             },
             gpp_exe=compiler,
+            test_cases_run=0,
         ).__dict__
+
+    effective_input_cases = input_cases if input_cases is not None else []
+    if not effective_input_cases:
+        effective_input_cases = [input_data if input_data is not None else ""]
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         modernized_cpp_path = os.path.join(tmp_dir, "modernized.cpp")
@@ -416,20 +474,22 @@ def run_differential_test(
         with open(modernized_cpp_path, "w", encoding="utf-8") as f:
             f.write(modernized_code)
 
-        original_result = _compile_and_run_cpp(
+        original_compile_probe = _compile_and_run_cpp(
             original_cpp_path,
             compiler,
             tmp_dir,
             "original.exe",
-            input_data=input_data,
+            input_data=effective_input_cases[0],
             enable_sanitizers=False,  # Don't sanitize legacy code—only the modernized version.
+            compile_timeout_seconds=compile_timeout_seconds,
+            run_timeout_seconds=run_timeout_seconds,
         )
 
-        if not (original_result["compile_success"] and original_result["run_success"]):
+        if not original_compile_probe["compile_success"]:
             return DifferentialTestResult(
                 parity_ok=False,
-                diff_text="",
-                original=original_result,
+                diff_text="Original code failed to compile. Please fix legacy source before differential testing.",
+                original=original_compile_probe,
                 modernized={
                     "compile_success": False,
                     "run_success": False,
@@ -439,112 +499,307 @@ def run_differential_test(
                     "run_time_ms": 0,
                 },
                 gpp_exe=compiler,
+                test_cases_run=0,
             ).__dict__
 
-        modernized_result = _compile_and_run_cpp(
+        modernized_compile_probe = _compile_and_run_cpp(
             modernized_cpp_path,
             compiler,
             tmp_dir,
             "modernized.exe",
-            input_data=input_data,
+            input_data=effective_input_cases[0],
             enable_sanitizers=True,
+            compile_timeout_seconds=compile_timeout_seconds,
+            run_timeout_seconds=run_timeout_seconds,
         )
 
-        if not modernized_result["compile_success"]:
+        if not modernized_compile_probe["compile_success"]:
             location = _extract_error_location(
-                modernized_result["stderr"], os.path.basename(modernized_cpp_path)
+                modernized_compile_probe["stderr"], os.path.basename(modernized_cpp_path)
             )
             if location:
-                modernized_result["stderr"] = (
-                    modernized_result["stderr"] + "\n" + f"First error location: {location}"
+                modernized_compile_probe["stderr"] = (
+                    modernized_compile_probe["stderr"] + "\n" + f"First error location: {location}"
                 )
             return DifferentialTestResult(
                 parity_ok=False,
-                diff_text="",
-                original=original_result,
-                modernized=modernized_result,
+                diff_text="Modernized code failed to compile. See compiler diagnostics.",
+                original=original_compile_probe,
+                modernized=modernized_compile_probe,
                 gpp_exe=compiler,
+                test_cases_run=0,
             ).__dict__
 
-        if not modernized_result["run_success"]:
-            return DifferentialTestResult(
-                parity_ok=False,
-                diff_text="",
-                original=original_result,
-                modernized=modernized_result,
-                gpp_exe=compiler,
-            ).__dict__
+        original_compile_ms = int(original_compile_probe.get("compile_time_ms", 0) or 0)
+        modernized_compile_ms = int(modernized_compile_probe.get("compile_time_ms", 0) or 0)
+        original_cases: list[dict] = []
+        modernized_cases: list[dict] = []
+        all_sanitizer_findings: list[str] = []
+        total_original_run_ms = 0
+        total_modernized_run_ms = 0
+        max_original_peak: int | None = None
+        max_modernized_peak: int | None = None
 
-        norm_orig = _normalize_output(original_result["stdout"])
-        norm_mod = _normalize_output(modernized_result["stdout"])
-        norm_orig_err = _normalize_output(original_result.get("stderr", ""))
-        norm_mod_err = _normalize_output(modernized_result.get("stderr", ""))
-        orig_exit = int(original_result.get("exit_code", 0))
-        mod_exit = int(modernized_result.get("exit_code", 0))
-
-        # --- Sanitizer & memory analysis on the *modernized* run ---
-        mod_sanitizer_findings = modernized_result.get("sanitizer_findings") or []
-        sanitizer_clean = len(mod_sanitizer_findings) == 0
-
-        orig_peak = original_result.get("peak_memory_kb")
-        mod_peak = modernized_result.get("peak_memory_kb")
-        memory_delta_kb: int | None = None
-        if orig_peak is not None and mod_peak is not None:
-            memory_delta_kb = mod_peak - orig_peak  # negative = improvement
-
-        if norm_orig == norm_mod and norm_orig_err == norm_mod_err and orig_exit == mod_exit:
-            # Even if stdout matches, flag failure when sanitizers detected issues.
-            return DifferentialTestResult(
-                parity_ok=sanitizer_clean,  # fail if sanitizer found problems
-                diff_text="" if sanitizer_clean else (
-                    "Output matched, but sanitizer detected issues:\n"
-                    + "\n".join(mod_sanitizer_findings)
-                ),
-                original=original_result,
-                modernized=modernized_result,
-                gpp_exe=compiler,
-                sanitizer_clean=sanitizer_clean,
-                sanitizer_findings=mod_sanitizer_findings if mod_sanitizer_findings else None,
-                memory_delta_kb=memory_delta_kb,
-            ).__dict__
-
-        orig_lines = (norm_orig + "\n").splitlines(keepends=True)
-        mod_lines = (norm_mod + "\n").splitlines(keepends=True)
-        orig_err_lines = (norm_orig_err + "\n").splitlines(keepends=True)
-        mod_err_lines = (norm_mod_err + "\n").splitlines(keepends=True)
-
-        diff_lines = unified_diff(
-            orig_lines,
-            mod_lines,
-            fromfile="Original (test.cpp)",
-            tofile="Modernized",
-        )
-        err_diff_lines = unified_diff(
-            orig_err_lines,
-            mod_err_lines,
-            fromfile="Original stderr",
-            tofile="Modernized stderr",
-        )
-
-        diff_text_parts: list[str] = []
-        for line in diff_lines:
-            diff_text_parts.append(line)
-        for line in err_diff_lines:
-            diff_text_parts.append(line)
-        if orig_exit != mod_exit:
-            diff_text_parts.append(
-                f"\nExit code mismatch: original={orig_exit}, modernized={mod_exit}\n"
+        for case_index, case_input in enumerate(effective_input_cases):
+            original_case_result = _compile_and_run_cpp(
+                original_cpp_path,
+                compiler,
+                tmp_dir,
+                f"original_case_{case_index}.exe",
+                input_data=case_input,
+                enable_sanitizers=False,
+                compile_timeout_seconds=compile_timeout_seconds,
+                run_timeout_seconds=run_timeout_seconds,
+            )
+            modernized_case_result = _compile_and_run_cpp(
+                modernized_cpp_path,
+                compiler,
+                tmp_dir,
+                f"modernized_case_{case_index}.exe",
+                input_data=case_input,
+                enable_sanitizers=True,
+                compile_timeout_seconds=compile_timeout_seconds,
+                run_timeout_seconds=run_timeout_seconds,
             )
 
-        diff_text = "".join(diff_text_parts)
+            original_cases.append(original_case_result)
+            modernized_cases.append(modernized_case_result)
+
+            total_original_run_ms += int(original_case_result.get("run_time_ms", 0) or 0)
+            total_modernized_run_ms += int(modernized_case_result.get("run_time_ms", 0) or 0)
+
+            orig_peak_case = original_case_result.get("peak_memory_kb")
+            mod_peak_case = modernized_case_result.get("peak_memory_kb")
+            if isinstance(orig_peak_case, int):
+                max_original_peak = orig_peak_case if max_original_peak is None else max(max_original_peak, orig_peak_case)
+            if isinstance(mod_peak_case, int):
+                max_modernized_peak = mod_peak_case if max_modernized_peak is None else max(max_modernized_peak, mod_peak_case)
+
+            case_findings = modernized_case_result.get("sanitizer_findings") or []
+            all_sanitizer_findings.extend([str(item) for item in case_findings])
+
+            if not original_case_result.get("compile_success", False):
+                return DifferentialTestResult(
+                    parity_ok=False,
+                    diff_text=(
+                        f"Case {case_index}: original program failed to compile.\n"
+                        + str(original_case_result.get("stderr", ""))
+                    ),
+                    original={
+                        "compile_success": False,
+                        "run_success": False,
+                        "compile_time_ms": original_compile_ms,
+                        "run_time_ms": total_original_run_ms,
+                        "cases": original_cases,
+                    },
+                    modernized={
+                        "compile_success": True,
+                        "run_success": False,
+                        "compile_time_ms": modernized_compile_ms,
+                        "run_time_ms": total_modernized_run_ms,
+                        "cases": modernized_cases,
+                    },
+                    gpp_exe=compiler,
+                    sanitizer_clean=False,
+                    sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
+                    test_cases_run=case_index + 1,
+                    failed_case_index=case_index,
+                    performance_delta_ms=total_modernized_run_ms - total_original_run_ms,
+                ).__dict__
+
+            if not original_case_result.get("run_success", False):
+                reason = str(original_case_result.get("crash_reason") or "original runtime failure")
+                return DifferentialTestResult(
+                    parity_ok=False,
+                    diff_text=(
+                        f"Case {case_index}: original program runtime failure: {reason}.\n"
+                        + str(original_case_result.get("stderr", ""))
+                    ),
+                    original={
+                        "compile_success": True,
+                        "run_success": False,
+                        "compile_time_ms": original_compile_ms,
+                        "run_time_ms": total_original_run_ms,
+                        "cases": original_cases,
+                    },
+                    modernized={
+                        "compile_success": True,
+                        "run_success": False,
+                        "compile_time_ms": modernized_compile_ms,
+                        "run_time_ms": total_modernized_run_ms,
+                        "cases": modernized_cases,
+                    },
+                    gpp_exe=compiler,
+                    sanitizer_clean=False,
+                    sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
+                    test_cases_run=case_index + 1,
+                    failed_case_index=case_index,
+                    performance_delta_ms=total_modernized_run_ms - total_original_run_ms,
+                ).__dict__
+
+            if not modernized_case_result.get("compile_success", False):
+                return DifferentialTestResult(
+                    parity_ok=False,
+                    diff_text=(
+                        f"Case {case_index}: modernized program failed to compile.\n"
+                        + str(modernized_case_result.get("stderr", ""))
+                    ),
+                    original={
+                        "compile_success": True,
+                        "run_success": True,
+                        "compile_time_ms": original_compile_ms,
+                        "run_time_ms": total_original_run_ms,
+                        "cases": original_cases,
+                    },
+                    modernized={
+                        "compile_success": False,
+                        "run_success": False,
+                        "compile_time_ms": modernized_compile_ms,
+                        "run_time_ms": total_modernized_run_ms,
+                        "cases": modernized_cases,
+                    },
+                    gpp_exe=compiler,
+                    sanitizer_clean=False,
+                    sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
+                    test_cases_run=case_index + 1,
+                    failed_case_index=case_index,
+                    performance_delta_ms=total_modernized_run_ms - total_original_run_ms,
+                ).__dict__
+
+            if not modernized_case_result.get("run_success", False):
+                reason = str(modernized_case_result.get("crash_reason") or "modernized runtime failure")
+                return DifferentialTestResult(
+                    parity_ok=False,
+                    diff_text=(
+                        f"Case {case_index}: modernized program runtime failure: {reason}.\n"
+                        + str(modernized_case_result.get("stderr", ""))
+                    ),
+                    original={
+                        "compile_success": True,
+                        "run_success": True,
+                        "compile_time_ms": original_compile_ms,
+                        "run_time_ms": total_original_run_ms,
+                        "cases": original_cases,
+                    },
+                    modernized={
+                        "compile_success": True,
+                        "run_success": False,
+                        "compile_time_ms": modernized_compile_ms,
+                        "run_time_ms": total_modernized_run_ms,
+                        "cases": modernized_cases,
+                    },
+                    gpp_exe=compiler,
+                    sanitizer_clean=False,
+                    sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
+                    test_cases_run=case_index + 1,
+                    failed_case_index=case_index,
+                    performance_delta_ms=total_modernized_run_ms - total_original_run_ms,
+                ).__dict__
+
+            norm_orig = _normalize_output(str(original_case_result.get("stdout", "")))
+            norm_mod = _normalize_output(str(modernized_case_result.get("stdout", "")))
+            norm_orig_err = _normalize_output(str(original_case_result.get("stderr", "")))
+            norm_mod_err = _normalize_output(str(modernized_case_result.get("stderr", "")))
+            orig_exit = int(original_case_result.get("exit_code", 0) or 0)
+            mod_exit = int(modernized_case_result.get("exit_code", 0) or 0)
+
+            sanitizer_clean = len(case_findings) == 0
+            outputs_match = norm_orig == norm_mod
+            stderr_match = norm_orig_err == norm_mod_err
+            exit_match = orig_exit == mod_exit
+
+            if outputs_match and stderr_match and exit_match and sanitizer_clean:
+                continue
+
+            stdout_diff = "".join(
+                unified_diff(
+                    (norm_orig + "\n").splitlines(keepends=True),
+                    (norm_mod + "\n").splitlines(keepends=True),
+                    fromfile=f"case_{case_index}_original_stdout",
+                    tofile=f"case_{case_index}_modernized_stdout",
+                )
+            )
+            stderr_diff = "".join(
+                unified_diff(
+                    (norm_orig_err + "\n").splitlines(keepends=True),
+                    (norm_mod_err + "\n").splitlines(keepends=True),
+                    fromfile=f"case_{case_index}_original_stderr",
+                    tofile=f"case_{case_index}_modernized_stderr",
+                )
+            )
+            diff_parts: list[str] = [f"Case {case_index} mismatch diagnostics:\n"]
+            if not outputs_match:
+                diff_parts.append("stdout diff:\n" + stdout_diff)
+            if not stderr_match:
+                diff_parts.append("stderr diff:\n" + stderr_diff)
+            if not exit_match:
+                diff_parts.append(
+                    f"exit code mismatch: original={orig_exit}, modernized={mod_exit}\n"
+                )
+            if not sanitizer_clean:
+                diff_parts.append(
+                    "sanitizer diagnostics:\n" + "\n".join([str(item) for item in case_findings]) + "\n"
+                )
+
+            memory_delta_kb: int | None = None
+            if max_original_peak is not None and max_modernized_peak is not None:
+                memory_delta_kb = max_modernized_peak - max_original_peak
+
+            return DifferentialTestResult(
+                parity_ok=False,
+                diff_text="".join(diff_parts),
+                original={
+                    "compile_success": True,
+                    "run_success": True,
+                    "compile_time_ms": original_compile_ms,
+                    "run_time_ms": total_original_run_ms,
+                    "cases": original_cases,
+                },
+                modernized={
+                    "compile_success": True,
+                    "run_success": True,
+                    "compile_time_ms": modernized_compile_ms,
+                    "run_time_ms": total_modernized_run_ms,
+                    "cases": modernized_cases,
+                },
+                gpp_exe=compiler,
+                sanitizer_clean=False if all_sanitizer_findings else True,
+                sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
+                memory_delta_kb=memory_delta_kb,
+                test_cases_run=case_index + 1,
+                failed_case_index=case_index,
+                performance_delta_ms=total_modernized_run_ms - total_original_run_ms,
+            ).__dict__
+
+        memory_delta_kb: int | None = None
+        if max_original_peak is not None and max_modernized_peak is not None:
+            memory_delta_kb = max_modernized_peak - max_original_peak
 
         return DifferentialTestResult(
-            parity_ok=False,
-            diff_text=diff_text,
-            original=original_result,
-            modernized=modernized_result,
+            parity_ok=len(all_sanitizer_findings) == 0,
+            diff_text="" if len(all_sanitizer_findings) == 0 else (
+                "All outputs matched, but sanitizer detected issues:\n"
+                + "\n".join(all_sanitizer_findings)
+            ),
+            original={
+                "compile_success": True,
+                "run_success": True,
+                "compile_time_ms": original_compile_ms,
+                "run_time_ms": total_original_run_ms,
+                "cases": original_cases,
+            },
+            modernized={
+                "compile_success": True,
+                "run_success": True,
+                "compile_time_ms": modernized_compile_ms,
+                "run_time_ms": total_modernized_run_ms,
+                "cases": modernized_cases,
+            },
             gpp_exe=compiler,
-            sanitizer_clean=sanitizer_clean,
-            sanitizer_findings=mod_sanitizer_findings if mod_sanitizer_findings else None,
+            sanitizer_clean=len(all_sanitizer_findings) == 0,
+            sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
             memory_delta_kb=memory_delta_kb,
+            test_cases_run=len(effective_input_cases),
+            failed_case_index=None,
+            performance_delta_ms=total_modernized_run_ms - total_original_run_ms,
         ).__dict__

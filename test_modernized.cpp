@@ -1,71 +1,46 @@
-#include <iostream>
 #include <stdio.h>
-#include <expected> // For std::expected
-#include <string>   // For std::string error type
+#include <stdlib.h>
+#include <string.h>
 
-/**
- * Modernized Discount Calculator
- * This function is a leaf dependency.
- * Uses std::expected for internal error handling and logs errors.
- */
-float applyDiscount(float price, float percent) {
-    // Define an internal lambda or helper function that can return std::expected.
-    // This allows us to encapsulate the error-prone part and use std::expected
-    // while maintaining the original function signature.
-    auto calculate_discount_internal = [](float p, float pct) -> std::expected<float, std::string> {
-        if (p < 0.0f) {
-            return std::unexpected("Price cannot be negative.");
-        }
-        // Assuming a discount percentage should be between 0 and 100 for a "discount".
-        // If business rules allow negative percentages (markup) or percentages > 100,
-        // these checks would need to be adjusted.
-        if (pct < 0.0f || pct > 100.0f) {
-            return std::unexpected("Discount percent must be between 0 and 100.");
-        }
-        return p * (1.0f - (pct / 100.0f));
-    };
+// Global pointer - a nightmare for thread safety and modernization
+char* GLOBAL_LOG_BUFFER = NULL;
 
-    auto result = calculate_discount_internal(price, percent);
+typedef struct {
+    int id;
+    char* raw_data;
+    size_t len;
+} LegacyRecord;
 
-    if (result.has_value()) {
-        return result.value();
-    } else {
-        // Log the error and return a fallback value to maintain the float return type.
-        // Returning the original price means no discount is applied on error,
-        // which is a reasonable default behavior for invalid inputs.
-        std::cerr << "Error in applyDiscount: " << result.error()
-                  << " (Price: " << price << ", Percent: " << percent << "). Returning original price." << std::endl;
-        return price;
-    }
-}
+// Hard to modernize: returns raw pointer, uses malloc, and return codes for errors
+int load_record(LegacyRecord** out_rec, int id) {
+    if (id <= 0) return -1; // Error code
 
-/**
- * Main Processing Logic
- * Uses raw pointers and C-style iteration.
- */
-void processOrders() {
-    int count = 3;
-    float* prices = new float[3]; // Manual allocation
-    prices[0] = 100.0;
-    prices[1] = 200.0;
-    prices[2] = 300.0;
-
-    printf("Processing %d items...\n", count);
+    *out_rec = (LegacyRecord*)malloc(sizeof(LegacyRecord));
+    (*out_rec)->id = id;
     
-    float total = 0;
-    for (int i = 0; i < count; i++) {
-        // Nested dependency call
-        float finalPrice = applyDiscount(prices[i], 10.0f);
-        total += finalPrice;
-    }
-
-    std::cout << "Total after 10% discount: " << total << std::endl;
-
-    delete[] prices; // Manual deallocation
+    const char* dummy = "DEVICE_DATA_STREAM_0xCF";
+    (*out_rec)->len = strlen(dummy);
+    (*out_rec)->raw_data = (char*)malloc((*out_rec)->len + 1);
+    strcpy((*out_rec)->raw_data, dummy);
+    
+    return 0; // Success code
 }
 
+void process_data() {
+    LegacyRecord* rec = NULL;
+    // Pointer to pointer logic is a great test for std::expected and smart pointers
+    if (load_record(&rec, 42) == 0) {
+        printf("Processing Record %d: %s\n", rec->id, rec->raw_data);
+        
+        // Manual cleanup often forgotten by lazy AI
+        free(rec->raw_data);
+        free(rec);
+    } else {
+        printf("Failed to load record.\n");
+    }
+}
 
 int main() {
-    processOrders();
+    process_data();
     return 0;
 }

@@ -52,6 +52,20 @@ _STD_HEADER_SYMBOLS: Dict[str, Set[str]] = {
 }
 
 
+_TEMPLATE_SYMBOL_BASES: Dict[str, Set[str]] = {
+    "<vector>": {"vector"},
+    "<string>": {"string", "string_view"},
+    "<map>": {"map", "multimap"},
+    "<unordered_map>": {"unordered_map", "unordered_multimap"},
+    "<set>": {"set", "multiset"},
+    "<unordered_set>": {"unordered_set", "unordered_multiset"},
+    "<optional>": {"optional"},
+    "<variant>": {"variant"},
+    "<tuple>": {"tuple"},
+    "<memory>": {"unique_ptr", "shared_ptr", "weak_ptr"},
+}
+
+
 class CppParser:
     """High-fidelity C++ semantic extraction engine for modernization workflows."""
 
@@ -81,7 +95,7 @@ class CppParser:
         if hasattr(parser, "language"):
             parser.language = cpp_language
         elif hasattr(parser, "set_language"):
-            parser.set_language(cpp_language)
+            parser.set_language(cpp_language)  # type: ignore[attr-defined]
         else:
             raise RuntimeError("Unsupported tree-sitter Parser API for setting language")
 
@@ -368,6 +382,12 @@ class CppParser:
                     required.append(header_name)
                     continue
 
+            template_bases = _TEMPLATE_SYMBOL_BASES.get(header_name)
+            if template_bases:
+                if any(self._symbol_or_template_use(base_symbol, text) for base_symbol in template_bases):
+                    required.append(header_name)
+                    continue
+
             # Fallback: if include is project header and its basename symbol appears.
             if header_name.startswith('"') and header_name.endswith('"'):
                 base = Path(header_name.strip('"')).stem
@@ -389,6 +409,15 @@ class CppParser:
             return False
         pattern = r"(?<!\w)" + re.escape(symbol) + r"(?!\w)"
         return re.search(pattern, text) is not None
+
+    @staticmethod
+    def _symbol_or_template_use(base_symbol: str, text: str) -> bool:
+        """Detect `std::symbol`, `symbol`, and templated uses such as `symbol<T>`."""
+        if not base_symbol:
+            return False
+        plain_pattern = r"(?<!\w)(?:std::\s*)?" + re.escape(base_symbol) + r"(?!\w)"
+        template_pattern = r"(?<!\w)(?:std::\s*)?" + re.escape(base_symbol) + r"\s*<"
+        return re.search(plain_pattern, text) is not None or re.search(template_pattern, text) is not None
 
     @staticmethod
     def _extract_include_directive(node: Any, source_bytes: bytes) -> str:
@@ -814,6 +843,28 @@ class CppParser:
         return calls
 
     def _extract_callee_info(self, callee_node: Any, source_bytes: bytes) -> Optional[Dict[str, str]]:
+        if callee_node.type == "pointer_expression":
+            pointer_text = self._node_text(callee_node, source_bytes).strip()
+            # Function pointer calls often appear as (*fp)(...), normalize to fp.
+            pointer_name = pointer_text
+            pointer_name = re.sub(r"^\(\*", "", pointer_name)
+            pointer_name = re.sub(r"\)$", "", pointer_name)
+            pointer_name = pointer_name.strip("*() ")
+            if pointer_name:
+                return {"name": pointer_name, "display": pointer_name, "kind": "function_pointer"}
+
+        if callee_node.type == "lambda_expression":
+            return {"name": "<lambda>", "display": "<lambda>", "kind": "lambda"}
+
+        if callee_node.type in {"parenthesized_expression", "subscript_expression"}:
+            expr_text = self._node_text(callee_node, source_bytes).strip()
+            if expr_text:
+                name_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)", expr_text)
+                if name_match:
+                    inferred_name = name_match.group(1)
+                    kind = "functor" if "[" in expr_text else "function_pointer"
+                    return {"name": inferred_name, "display": expr_text, "kind": kind}
+
         if callee_node.type == "field_expression":
             obj_node = callee_node.child_by_field_name("argument")
             field_node = callee_node.child_by_field_name("field")
@@ -821,6 +872,8 @@ class CppParser:
                 name = self._node_text(field_node, source_bytes).strip()
                 owner = self._node_text(obj_node, source_bytes).strip() if obj_node is not None else ""
                 display = f"{owner}.{name}" if owner else name
+                if name == "operator()":
+                    return {"name": owner or "operator()", "display": display, "kind": "functor"}
                 return {"name": name, "display": display, "kind": "method"}
 
         if callee_node.type in {"identifier", "field_identifier", "operator_name"}:
@@ -837,6 +890,11 @@ class CppParser:
             if subnode.type in {"field_identifier", "identifier", "operator_name"}:
                 text = self._node_text(subnode, source_bytes).strip()
                 if text:
+                    if text == "operator()":
+                        parent_text = self._node_text(callee_node, source_bytes).strip()
+                        owner_match = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*operator\s*\(\)", parent_text)
+                        owner_name = owner_match.group(1) if owner_match else "operator()"
+                        return {"name": owner_name, "display": parent_text or owner_name, "kind": "functor"}
                     return {"name": text, "display": text, "kind": "local"}
         return None
 
@@ -916,12 +974,6 @@ _LEGACY_PATTERN_SPECS: list[tuple[str, str, re.Pattern[str], str]] = [
         re.compile(r"\bdelete\s*(\[\])?\s*[A-Za-z_][A-Za-z0-9_]*\s*;"),
         "Manual delete detected; prefer std::unique_ptr or stack allocation.",
     ),
-    (
-        "c_style_cast",
-        "major",
-        re.compile(r"\([^\)\n]+\)\s*[A-Za-z_][A-Za-z0-9_:\->\.\[\]]*"),
-        "Potential C-style cast detected; prefer static_cast/reinterpret_cast.",
-    ),
 ]
 
 
@@ -942,6 +994,35 @@ def detect_legacy_patterns(source_text: str) -> List[Dict[str, Any]]:
                     "tag": "C++23 Overhaul",
                 }
             )
+
+    # AST-based C-style cast detection to avoid regex false positives such as
+    # parenthesized conditions in if/while expressions.
+    try:
+        parser = CppParser()
+        source_bytes = source_text.encode("utf-8")
+        tree = parser._parser.parse(source_bytes)
+        line_starts = parser._compute_line_start_bytes(source_text)
+        cast_node_types = {"cast_expression", "c_style_cast_expression"}
+
+        for node in parser._iter_nodes(tree.root_node):
+            if node.type not in cast_node_types:
+                continue
+            snippet = parser._node_text(node, source_bytes).strip()
+            if not snippet:
+                continue
+            findings.append(
+                {
+                    "pattern": "c_style_cast",
+                    "severity": "major",
+                    "line": parser._byte_to_line_number(node.start_byte, line_starts),
+                    "match": snippet,
+                    "message": "Potential C-style cast detected; prefer static_cast/reinterpret_cast.",
+                    "tag": "C++23 Overhaul",
+                }
+            )
+    except Exception:
+        # If parser fails for any reason, keep regex-based findings only.
+        pass
 
     findings.sort(key=lambda item: (int(item.get("line", 0)), str(item.get("pattern", ""))))
     return findings

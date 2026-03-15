@@ -64,6 +64,10 @@ _ALLOWED_COMPILERS: set[str] = {
     "make", "cmake", "ninja",
 }
 
+_RUN_COMPILER_TIMEOUT_SECONDS = 30
+_SEARCH_MAX_FILES_SCANNED = 2000
+_MAX_BINARY_OUTPUT_CHARS = 10_000
+
 _MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
 _MODEL_BRIDGE = GeminiBridge.from_env(
     log_fn=lambda message: print(message, file=sys.stderr)
@@ -220,6 +224,17 @@ def _tool_log(tool_name: str, detail: str) -> None:
     print(f"Tool '{tool_name}' called: {detail}", file=sys.stderr, flush=True)
 
 
+def _truncate_text(value: str, max_chars: int) -> tuple[str, bool]:
+    """Truncate long text for safer JSON responses."""
+    if max_chars <= 0:
+        return "", bool(value)
+    if len(value) <= max_chars:
+        return value, False
+    suffix = "\n...<truncated>"
+    keep = max(0, max_chars - len(suffix))
+    return value[:keep] + suffix, True
+
+
 # ===================================================================
 # MCP tools
 # ===================================================================
@@ -307,6 +322,7 @@ def write_code(file_path: str, content: str) -> str:
     try:
         with open(absolute_path, "w", encoding="utf-8") as fh:
             fh.write(content)
+        _GlobalProjectMapCache.get().invalidate()
         return _make_result(
             "success",
             message=f"Wrote {len(content)} characters to {absolute_path}",
@@ -439,6 +455,7 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
             cwd=working_directory_resolved or None,
             capture_output=True,
             text=True,
+            timeout=_RUN_COMPILER_TIMEOUT_SECONDS,
         )
     except FileNotFoundError:
         result = _make_result(
@@ -448,6 +465,18 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
         )
         parsed = json.loads(result)
         _MODEL_BRIDGE.mark_trace_error("run_compiler executable missing", details=parsed)
+        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+        return result
+    except subprocess.TimeoutExpired:
+        result = _make_result(
+            "error",
+            message=(
+                f"Compiler execution exceeded timeout of {_RUN_COMPILER_TIMEOUT_SECONDS} seconds "
+                "and was terminated."
+            ),
+        )
+        parsed = json.loads(result)
+        _MODEL_BRIDGE.mark_trace_error("run_compiler timeout", details=parsed)
         _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
         return result
     except Exception as error:
@@ -535,14 +564,19 @@ def run_binary(path: str, timeout: int = 5) -> str:
             return _make_result("error", message=f"Unexpected problem while running the binary: {error!r}")
 
     exit_code = completed_process.returncode
-    stdout = (completed_process.stdout or "").strip()
-    stderr = (completed_process.stderr or "").strip()
+    stdout_raw = (completed_process.stdout or "").strip()
+    stderr_raw = (completed_process.stderr or "").strip()
+    stdout, stdout_truncated = _truncate_text(stdout_raw, _MAX_BINARY_OUTPUT_CHARS)
+    stderr, stderr_truncated = _truncate_text(stderr_raw, _MAX_BINARY_OUTPUT_CHARS)
 
     return _make_result(
         "success" if exit_code == 0 else "error",
         exit_code=exit_code,
         stdout=stdout,
         stderr=stderr,
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+        max_output_chars=_MAX_BINARY_OUTPUT_CHARS,
     )
 
 
@@ -668,6 +702,11 @@ def search_code(query: str, file_pattern: str = "*") -> str:
         files.append(matched)
 
     files = sorted(set(files))
+    total_candidate_files = len(files)
+    scan_limit_reached = total_candidate_files > _SEARCH_MAX_FILES_SCANNED
+    if scan_limit_reached:
+        files = files[:_SEARCH_MAX_FILES_SCANNED]
+
     if not files:
         return _make_result("success", matches=[], files_scanned=0, message=f"No files matched pattern '{pattern}'.")
 
@@ -703,6 +742,9 @@ def search_code(query: str, file_pattern: str = "*") -> str:
         matches=matches,
         total_matches=len(matches),
         files_scanned=files_scanned,
+        total_candidate_files=total_candidate_files,
+        max_files_scanned=_SEARCH_MAX_FILES_SCANNED,
+        scan_limit_reached=scan_limit_reached,
         skipped_decode_errors=files_with_decode_errors,
         truncated=len(matches) >= max_results,
     )
@@ -1540,4 +1582,5 @@ def get_compilation_errors(
 
 
 if __name__ == "__main__":
+    _GlobalProjectMapCache.get().build_in_background()
     mcp_server.run()
