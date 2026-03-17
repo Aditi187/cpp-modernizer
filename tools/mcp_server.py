@@ -31,6 +31,9 @@ load_dotenv(
     override=True,
 )  # Load .env from project root explicitly and override inherited empty values.
 
+from core.logger import get_logger
+logger = get_logger(__name__)
+
 from core.gemini_bridge import (
     CPP_MODERNIZATION_SYSTEM_PROMPT,
     GeminiBridge,
@@ -88,7 +91,7 @@ if _ALLOW_RISKY_BUILD_TOOLS:
 
 _MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
 _MODEL_BRIDGE = GeminiBridge.from_env(
-    log_fn=lambda message: print(message, file=sys.stderr)
+    log_fn=logger.info
 )
 
 

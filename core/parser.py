@@ -178,6 +178,7 @@ class CppParser:
             source_bytes,
             source_file=source_file or self._current_file_path,
         )
+        project_map["module_imports"] = detect_module_imports(source_text)
         self._last_project_map = project_map
         return project_map
 
@@ -1164,6 +1165,50 @@ def extract_functions_from_cpp_file(file_path: str) -> List[Dict[str, Any]]:
     if not isinstance(functions, list):
         return []
     return functions
+
+
+# ---------------------------------------------------------------------------
+# C++20/23 module-import patterns
+# ---------------------------------------------------------------------------
+# Matches: `import <header>;`, `import "header";`, `import module.name;`
+_CPP20_IMPORT_RE: re.Pattern[str] = re.compile(
+    r"^\s*(?:export\s+)?import\s+"
+    r"(?:"
+    r"(<[^>]+>)"           # import <header>;
+    r"|"
+    r'("(?:[^"\\]|\\.)*")' # import "header";
+    r"|"
+    r"([\w.]+)"            # import module_name;
+    r")\s*;",
+    re.MULTILINE,
+)
+# Matches: `export module module_name;` and `module module_name;`
+_CPP20_MODULE_DECL_RE: re.Pattern[str] = re.compile(
+    r"^\s*(?:export\s+)?module\s+([\w.]+)\s*;",
+    re.MULTILINE,
+)
+
+
+def detect_module_imports(source_text: str) -> List[Dict[str, Any]]:
+    """Return C++20 module-import and module-declaration records found in *source_text*.
+
+    Each entry has the keys:
+    - ``kind``: ``"import"`` or ``"module_decl"``
+    - ``target``: the imported name / header / module identifier
+    - ``line``: 1-based line number
+    - ``raw``: the matched source text
+    """
+    results: List[Dict[str, Any]] = []
+    for match in _CPP20_IMPORT_RE.finditer(source_text):
+        angle, quoted, named = match.group(1), match.group(2), match.group(3)
+        target = (angle or quoted or named or "").strip()
+        line = source_text.count("\n", 0, match.start()) + 1
+        results.append({"kind": "import", "target": target, "line": line, "raw": match.group(0).strip()})
+    for match in _CPP20_MODULE_DECL_RE.finditer(source_text):
+        line = source_text.count("\n", 0, match.start()) + 1
+        results.append({"kind": "module_decl", "target": match.group(1).strip(), "line": line, "raw": match.group(0).strip()})
+    results.sort(key=lambda r: r["line"])
+    return results
 
 
 _LEGACY_PATTERN_SPECS: list[tuple[str, str, re.Pattern[str], str]] = [

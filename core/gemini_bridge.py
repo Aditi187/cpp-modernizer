@@ -10,6 +10,8 @@ import time
 import re
 import threading
 
+import time
+
 import requests
 
 try:
@@ -48,6 +50,7 @@ _GEMINI_CACHE_FILENAME = ".gemini_cache.json"
 DEFAULT_SHORT_CODE_RESPONSE_THRESHOLD = 500
 DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS = 10
 DEFAULT_GEMINI_CACHE_VERSION = "v1"
+DEFAULT_CACHE_TTL_SECONDS = 7 * 86400  # 7 days; 0 = no TTL
 
 LAST_REQUEST_TIME = 0.0
 MIN_REQUEST_INTERVAL = float(os.environ.get("LLM_MIN_REQUEST_INTERVAL_SECONDS", "6.0") or "6.0")
@@ -465,15 +468,21 @@ class GeminiBridge:
         self.config = config or GeminiConfig.from_env()
         self._log_fn = log_fn
         self.tracker = LangfuseTracker(log_fn=log_fn)
-        self._cache_enabled = os.environ.get("GEMINI_ENABLE_CACHE", "1").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        self._cache_version = os.environ.get("GEMINI_CACHE_VERSION", DEFAULT_GEMINI_CACHE_VERSION).strip() or DEFAULT_GEMINI_CACHE_VERSION
+        # USE_CACHE=false disables all LLM response caching universally.
+        _use_cache_global = os.environ.get("USE_CACHE", "1").strip().lower() not in {"0", "false", "no", "off"}
+        _gemini_cache_flag = os.environ.get("GEMINI_ENABLE_CACHE", "1").strip().lower() in {"1", "true", "yes", "on"}
+        self._cache_enabled = _use_cache_global and _gemini_cache_flag
+        self._cache_version = (
+            os.environ.get("CACHE_VERSION", "")
+            or os.environ.get("GEMINI_CACHE_VERSION", DEFAULT_GEMINI_CACHE_VERSION)
+        ).strip() or DEFAULT_GEMINI_CACHE_VERSION
+        try:
+            _raw_ttl = os.environ.get("CACHE_TTL_SECONDS", str(DEFAULT_CACHE_TTL_SECONDS)).strip()
+            self._cache_ttl_seconds: int = max(0, int(_raw_ttl)) if _raw_ttl else DEFAULT_CACHE_TTL_SECONDS
+        except ValueError:
+            self._cache_ttl_seconds = DEFAULT_CACHE_TTL_SECONDS
         self._cache_path = os.path.join(os.getcwd(), _GEMINI_CACHE_FILENAME)
-        self._response_cache: dict[str, str] = self._load_cache()
+        self._response_cache: dict[str, dict] = self._load_cache()
 
     @classmethod
     def from_env(
@@ -565,7 +574,8 @@ class GeminiBridge:
         )
         return hashlib.sha256(digest_source.encode("utf-8")).hexdigest()
 
-    def _load_cache(self) -> dict[str, str]:
+    def _load_cache(self) -> dict[str, dict]:
+        """Load cache from disk, filtering entries that exceed TTL or have wrong type."""
         if not self._cache_enabled:
             return {}
         if not os.path.isfile(self._cache_path):
@@ -573,15 +583,27 @@ class GeminiBridge:
         try:
             with open(self._cache_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            if isinstance(data, dict):
-                return {
-                    str(key): str(value)
-                    for key, value in data.items()
-                    if isinstance(key, str) and isinstance(value, str)
-                }
         except Exception:
             return {}
-        return {}
+        if not isinstance(data, dict):
+            return {}
+        now = time.time()
+        result: dict[str, dict] = {}
+        for key, entry in data.items():
+            if not isinstance(key, str):
+                continue
+            # Support legacy format where entry is a plain string.
+            if isinstance(entry, str):
+                entry = {"v": entry, "ts": 0.0}
+            if not isinstance(entry, dict) or "v" not in entry:
+                continue
+            # Apply TTL filter.
+            if self._cache_ttl_seconds > 0:
+                entry_ts = float(entry.get("ts") or 0.0)
+                if now - entry_ts > self._cache_ttl_seconds:
+                    continue
+            result[key] = entry
+        return result
 
     def _save_cache(self) -> None:
         if not self._cache_enabled:
@@ -823,10 +845,12 @@ class GeminiBridge:
             prompt_for_request = prompt_for_request[-MAX_PROMPT_CHARS:]
 
         cache_key = self._cache_key(system_prompt, prompt_for_request, temperature)
-        cached = self._response_cache.get(cache_key) if self._cache_enabled else None
-        if cached is not None:
-            self._log("Gemini cache hit; returning cached completion.")
-            return cached
+        cached_entry = self._response_cache.get(cache_key) if self._cache_enabled else None
+        if cached_entry is not None:
+            cached = cached_entry.get("v") or (cached_entry if isinstance(cached_entry, str) else None)
+            if cached:
+                self._log("Gemini cache hit; returning cached completion.")
+                return cached
 
         enforce_full_response = _expects_large_code_response(prompt_for_request)
         last_exc: Exception | None = None
@@ -904,7 +928,7 @@ class GeminiBridge:
                     f"chars={len(cleaned_content)}"
                 )
                 if self._cache_enabled:
-                    self._response_cache[cache_key] = cleaned_content
+                    self._response_cache[cache_key] = {"v": cleaned_content, "ts": time.time()}
                     self._save_cache()
                 return cleaned_content
 

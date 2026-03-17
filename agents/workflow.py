@@ -50,6 +50,9 @@ from core.gemini_bridge import GeminiBridge
 from core.openrouter_bridge import OpenRouterBridge
 from core.inspect_parser import score_cpp23_compliance
 from agents.function_modernizer import code_similarity_ratio
+from core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _has_provider_api_key() -> bool:
@@ -62,21 +65,21 @@ def _has_provider_api_key() -> bool:
 def _select_model_bridge() -> tuple[Any, str]:
     preferred_provider = os.environ.get("WORKFLOW_MODEL_PROVIDER", "").strip().lower()
     if preferred_provider == "openrouter":
-        return OpenRouterBridge.from_env(log_fn=print), "openrouter"
+        return OpenRouterBridge.from_env(log_fn=logger.info), "openrouter"
     if preferred_provider in {"gemini", "openai"}:
-        bridge = GeminiBridge.from_env(log_fn=print)
+        bridge = GeminiBridge.from_env(log_fn=logger.info)
         provider_name = str(getattr(getattr(bridge, "config", None), "provider", "gemini") or "gemini")
         return bridge, provider_name
     if preferred_provider == "ollama":
-        return LocalOllamaBridge.from_env(log_fn=print), "ollama"
+        return LocalOllamaBridge.from_env(log_fn=logger.info), "ollama"
 
     if os.environ.get("OPENROUTER_API_KEY", "").strip():
-        return OpenRouterBridge.from_env(log_fn=print), "openrouter"
+        return OpenRouterBridge.from_env(log_fn=logger.info), "openrouter"
     if _has_provider_api_key():
-        bridge = GeminiBridge.from_env(log_fn=print)
+        bridge = GeminiBridge.from_env(log_fn=logger.info)
         provider_name = str(getattr(getattr(bridge, "config", None), "provider", "gemini") or "gemini")
         return bridge, provider_name
-    bridge = LocalOllamaBridge.from_env(log_fn=print)
+    bridge = LocalOllamaBridge.from_env(log_fn=logger.info)
     return bridge, "ollama"
 
 
@@ -133,7 +136,9 @@ def call_model(system_prompt: str, user_prompt: str) -> str:
 def check_model_health() -> bool:
     """Verify the configured model provider is reachable and ready."""
     is_healthy, message = _MODEL_BRIDGE.check_health()
-    print(f"[{_MODEL_PROVIDER}] " + (("✅ " if is_healthy else "❌ ") + message))
+    status = "✅ " if is_healthy else "❌ "
+    log_fn = logger.info if is_healthy else logger.error
+    log_fn("[%s] %s%s", _MODEL_PROVIDER, status, message)
     return is_healthy
 
 
@@ -698,9 +703,9 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
       - Identifies orphan functions (no callers) and circular recursions (cycles).
       - Produces both a machine-friendly JSON analysis and a human-readable analysis_report.
     """
-    print("\n🔍 ANALYZER NODE")  # This print helps you see in the console when the analyzer node is running.
-    print(f"Language: {state['language']}")  # This print shows which language label the workflow thinks it is processing.
-    print(f"Input Code (first 200 chars):\n{state['code'][:200]}...")  # This print gives you a quick peek at the beginning of the input code for context.
+    logger.info("\n🔍 ANALYZER NODE")
+    logger.info("Language: %s", state['language'])
+    logger.debug("Input Code (first 200 chars):\n%s...", state['code'][:200])
 
     is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether the language label indicates C++, which is when we want to use the Tree-sitter parser.
 
@@ -775,7 +780,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     state["current_function_name"] = ""
     state["current_function_span"] = (0, 0)
     state["partial_success"] = False
-    print(f"Analysis (JSON):\n{state['analysis']}")  # This print displays the analysis JSON in the console so you can see exactly what the analyzer found.
+    logger.debug("Analysis (JSON):\n%s", state['analysis'])
 
     return state  # This return passes the updated state object along to the next node in the workflow.
 
@@ -790,11 +795,11 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
         source text, except for the entry point 'main'.
       - Updates state["code"] with a pruned version to reduce the LLM's workload.
     """
-    print("\n✂️  PRUNER NODE")  # This print marks the start of the pruning step in the console.
+    logger.info("\n✂️  PRUNER NODE")
 
     is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ code.
     if not is_cpp:  # This condition skips pruning for non-C++ languages.
-        print("Pruner: skipping (non-C++ language).")
+        logger.info("Pruner: skipping (non-C++ language).")
         return state  # This return leaves the state unchanged.
 
     if not state.get("analysis"):
@@ -809,25 +814,25 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
             state["analysis"] = json.dumps(pre_analysis)
             state["orphans"] = pre_orphans
         except Exception:
-            print("Pruner: no analysis found and pre-analysis failed, skipping pruning.")
+            logger.warning("Pruner: no analysis found and pre-analysis failed, skipping pruning.")
             return state
 
     try:
         analysis_obj = json.loads(state["analysis"])  # This line parses the JSON analysis string into a Python dictionary.
     except json.JSONDecodeError:
-        print("Pruner: failed to parse analysis JSON, skipping pruning.")  # This print warns that analysis could not be decoded.
+        logger.warning("Pruner: failed to parse analysis JSON, skipping pruning.")
         return state  # This return leaves the state unchanged.
 
     functions_info = state.get("functions_info") or analysis_obj.get("functions") or []  # This line reads cached function metadata first.
     orphans = state.get("orphans") or analysis_obj.get("orphans") or []  # This line prefers the orphans recorded on the state but falls back to the analysis JSON.
     if not functions_info or not orphans:  # This condition checks whether there is anything to prune.
-        print("Pruner: no functions or no orphans detected, skipping pruning.")  # This print explains why no pruning will happen.
+        logger.info("Pruner: no functions or no orphans detected, skipping pruning.")
         return state  # This return leaves the state unchanged.
 
     # We never prune the program entry point 'main', even if it has no callers.
     orphans_to_prune = {str(name) for name in orphans if str(name) != "main"}  # This set records orphan function names that are eligible for pruning.
     if not orphans_to_prune:
-        print("Pruner: orphan list only contains 'main' or is empty, nothing to prune.")  # This print explains that we intentionally keep main.
+        logger.info("Pruner: orphan list only contains 'main' or is empty, nothing to prune.")
         return state  # This return leaves the state unchanged.
 
     original_code = state["code"]  # This line reads the original source code text from the state.
@@ -845,7 +850,7 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
             spans_to_remove.append((start_byte, end_byte))  # This line records the valid span.
 
     if not spans_to_remove:  # This condition checks whether we have any valid spans to delete.
-        print("Pruner: no valid byte spans found for orphan functions, skipping pruning.")  # This print explains why pruning will not proceed.
+        logger.warning("Pruner: no valid byte spans found for orphan functions, skipping pruning.")
         return state  # This return leaves the state unchanged.
 
     spans_to_remove.sort(key=lambda pair: pair[0])  # This line sorts the spans by starting offset so we can rebuild the code in order.
@@ -892,7 +897,7 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
         name for name in existing_order if name not in orphans_to_prune
     ]
 
-    print(f"✂️  Pruning {len(spans_to_remove)} orphan function(s): {', '.join(sorted(orphans_to_prune))}")  # This print summarizes what was removed in a visually distinct way.
+    logger.info("✂️  Pruning %d orphan function(s): %s", len(spans_to_remove), ', '.join(sorted(orphans_to_prune)))
 
     return state  # This return passes the updated state object along to the next node in the workflow.
 
@@ -902,11 +907,11 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     Node 2: Modernizer - Rewrites code to modern standards
     Receives error_log if coming from verifier feedback
     """
-    print("\n✏️  MODERNIZER NODE")  # This print marks the start of a modernization attempt in the console.
-    print(f"Attempt: {state['attempt_count']} (per-current-function)")  # This print shows how many retries have been attempted for the current function.
+    logger.info("\n✏️  MODERNIZER NODE")
+    logger.info("Attempt: %d (per-current-function)", state['attempt_count'])
 
     if state["error_log"]:  # This condition checks whether the verifier or tester reported any previous issues.
-        print(f"Previous Feedback:\n{state['error_log']}")  # This print shows that feedback so you can see what the model is being asked to fix.
+        logger.info("Previous Feedback:\n%s", state['error_log'])
 
     # Prefer the last known compiling snapshot as our base, then fall back.
     source_to_improve = (
@@ -915,7 +920,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         or state["code"]
     )
 
-    print(f"Source Snapshot (preview, first 200 chars only for logging):\n{source_to_improve[:200]}...")  # This print is only a console preview.
+    logger.debug("Source Snapshot (preview):\n%s...", source_to_improve[:200])
 
     is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ so we know whether to ask for C++23 modernization.
 
@@ -945,7 +950,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             current_index += 1
 
         if current_index >= len(modernization_order):
-            print("No remaining functions in modernization_order; leaving code unchanged.")
+            logger.info("No remaining functions in modernization_order; leaving code unchanged.")
             state["modernized_code"] = source_to_improve
             state["attempt_count"] += 1
             return state
@@ -970,7 +975,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             and 0 <= start_byte <= end_byte <= len(source_bytes)
         ):
             warning = f"Missing valid byte span for function '{current_function_name}', skipping."
-            print(f"⚠️  {warning}")
+            logger.warning("%s", warning)
             state["error_log"] = warning
             state["attempt_count"] += 1
             state["modernized_code"] = source_to_improve
@@ -983,7 +988,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                 f"Skipping large function '{current_function_name}' "
                 f"({len(function_source)} chars > {_MAX_MODERNIZER_FUNCTION_CHARS})."
             )
-            print(warning)
+            logger.warning("%s", warning)
             state["error_log"] = warning
             state["modernized_code"] = source_to_improve
             state["attempt_count"] += 1
@@ -1000,9 +1005,9 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         _rule_preview_function, transform_notes = _apply_rule_based_function_transforms(function_source)
 
         if transform_notes:
-            print("Rule-based transforms applied: " + ", ".join(transform_notes))
+            logger.info("Rule-based transforms applied: %s", ", ".join(transform_notes))
         else:
-            print("Rule-based transforms applied: none")
+            logger.debug("Rule-based transforms applied: none")
 
         callers_map = _build_callers_map(state.get("dependency_map", {}))
         callers = sorted(callers_map.get(current_function_name, []))
@@ -1045,7 +1050,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             rejection_reason = ""
             for model_attempt in range(1, _MODEL_OUTPUT_ATTEMPTS + 1):
                 raw_text = call_model(_MODEL_SYSTEM_PROMPT, prompt_for_attempt)
-                print(f"DEBUG: Model response attempt {model_attempt} (first 200 chars): {raw_text[:200]}...")
+                logger.debug("Model response attempt %d (first 200 chars): %s...", model_attempt, raw_text[:200])
 
                 cleaned_candidate = _clean_model_code_block(raw_text).strip()
                 if not cleaned_candidate:
@@ -1060,13 +1065,13 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                     rejection_reason = ""
                     break
 
-                print(f"⚠️  Rejecting model output attempt {model_attempt}: {rejection_reason}.")
+                logger.warning("Rejecting model output attempt %d: %s.", model_attempt, rejection_reason)
                 if model_attempt < _MODEL_OUTPUT_ATTEMPTS:
                     prompt_for_attempt = _build_retry_prompt(full_prompt, rejection_reason, raw_text)
 
             if rejection_reason:
                 warning = f"Model returned unusable output for '{current_function_name}': {rejection_reason}."
-                print(f"⚠️  {warning}")
+                logger.warning("%s", warning)
                 state["error_log"] = warning
                 modernized = source_to_improve
             else:
@@ -1080,7 +1085,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                     )
                 )
                 if diff_lines:
-                    print("\n".join(diff_lines))
+                    logger.debug("\n".join(diff_lines))
                 modernized = _replace_function_by_span(
                     source_to_improve,
                     start_byte,
@@ -1093,7 +1098,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                 modernized = IncludeManager().update_file_includes(modernized, cleaned_candidate)
         except Exception as exc:
             error_message = f"Model call failed in modernizer: {exc!r}"
-            print(error_message)
+            logger.error("%s", error_message)
             if state["error_log"]:
                 state["error_log"] += f"\n{error_message}"
             else:
@@ -1105,7 +1110,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     state["modernized_code"] = modernized  # This line stores the modernized (or minimally transformed) code back into the shared workflow state.
     state["attempt_count"] += 1  # This line increments the attempt counter so the router can track how many modernization passes we have performed.
 
-    print(f"Modernized Code (first 200 chars):\n{modernized[:200]}...")  # This print shows the beginning of the modernized code so you can see what changed.
+    logger.debug("Modernized Code (first 200 chars):\n%s...", modernized[:200])
 
     return state  # This return passes the updated state on to the verifier node.
 
@@ -1114,14 +1119,14 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
     """
     Node 3: Verifier - Validates modernized code via MCP compiler tool
     """
-    print("\n✅ VERIFIER NODE")  # This print marks the start of the verification step in the console.
-    print("Validating modernized code with real g++ compilation...")  # This print explains that we are about to run the actual compiler on the code.
+    logger.info("\n✅ VERIFIER NODE")
+    logger.info("Validating modernized code with real g++ compilation...")
 
     code_to_verify = state["modernized_code"]  # This line uses only the modernized_code field, because we want to compile exactly what the modernizer produced.
 
     if not code_to_verify.strip():  # This condition checks if the AI returned no code (empty or whitespace-only); if so, we stop the workflow entirely.
         message = "CRITICAL: Gemini returned no code. Check your model selection, API key, and max token settings."  # This line sets a precise failure message for empty AI output.
-        print(message)  # This print makes the critical condition visible in the console so you know why the workflow is stopping.
+        logger.error("%s", message)
         verification_result = {  # This dictionary records a failure result so the workflow can finish without calling the compiler.
             "success": False,  # This field marks the verification as a failure because there was nothing to compile.
             "errors": [message],  # This list stores the same message for the verification result.
@@ -1133,14 +1138,14 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         state["verification_result"] = verification_result  # This line stores the failure result in the shared state.
         state["error_log"] = message  # This line copies the exact error message into the error log for visibility in later inspection.
         state["attempt_count"] = 3  # This line sets attempts to max retry budget so the router safely terminates.
-        print(f"❌ Verification FAILED: {message}")  # This print reinforces the failure message in the console.
+        logger.error("❌ Verification FAILED: %s", message)
         return state  # This return exits early so we do not try to call g++ with empty input.
 
     verification_result = compile_cpp_source(code_to_verify)
     state["verification_result"] = verification_result
 
     if verification_result["success"]:  # This condition checks whether compilation finished successfully without errors.
-        print("✅ Verification PASSED")  # This print confirms in the console that the modernized code compiled successfully.
+        logger.info("✅ Verification PASSED")
         state["error_log"] = ""  # This line clears the error log because there are no compiler errors to feed back into the model.
         state["last_working_code"] = state["modernized_code"]
         state["compliance_report"] = score_cpp23_compliance(state["modernized_code"])
@@ -1149,7 +1154,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             compliance_percent = int(float(str(compliance_raw)))
         except (TypeError, ValueError):
             compliance_percent = 0
-        print(f"C++23 Compliance Score: {compliance_percent}%")
+        logger.info("C++23 Compliance Score: %d%%", compliance_percent)
 
         # Refresh parser/cache + dependency graph/order after each successful function replacement.
         parser = CppParser()
@@ -1190,7 +1195,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             next_index += 1
         state["current_function_index"] = next_index
     else:  # This branch handles the case where g++ returned at least one error.
-        print("❌ Verification FAILED")  # This print reports in the console that compilation failed.
+        logger.error("❌ Verification FAILED")
         state["compliance_report"] = {}
         raw_stderr = verification_result.get("raw_stderr", "")
         errors_list = verification_result.get("errors") or []
@@ -1208,8 +1213,8 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             )
 
         state["error_log"] = combined_error + critical_fix_section
-        print("⚠️ Compile failed, keeping modernization for inspection.")
-        print(f"Errors from g++:\n{state['error_log']}")  # This print shows the compiler errors so you can see exactly what went wrong.
+        logger.warning("Compile failed, keeping modernization for inspection.")
+        logger.warning("Errors from g++:\n%s", state['error_log'])
 
     return state  # This return passes the updated state (including verification results) back into the LangGraph router.
 
@@ -1224,7 +1229,7 @@ def tester_node(state: ModernizationState) -> ModernizationState:
       - Sets is_parity_passed and, on failure, records a unified diff in error_log so
         the modernizer can perform a self-healing pass focused on logic parity.
     """
-    print("\n🧪 TESTER NODE")  # This print marks the start of the tester step in the console.
+    logger.info("\n🧪 TESTER NODE")
 
     # Reset parity / equivalence flags and previous diff output before running a new test.
     state["is_parity_passed"] = True  # This line pessimistically assumes parity will pass; we flip it to False on failure.
@@ -1233,17 +1238,17 @@ def tester_node(state: ModernizationState) -> ModernizationState:
 
     is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ code.
     if not is_cpp:
-        print("Tester: skipping (non-C++ language).")
+        logger.info("Tester: skipping (non-C++ language).")
         return state  # This return leaves the state unchanged for non-C++ code.
 
     if not state["verification_result"].get("success"):  # This condition ensures we only run the tester when compilation succeeded.
-        print("Tester: skipping because compilation failed.")  # This print clarifies why we do not run the differential test.
+        logger.info("Tester: skipping because compilation failed.")
         state["is_parity_passed"] = False  # This line records that parity has not been confirmed.
         state["is_functionally_equivalent"] = False
         return state  # This return leaves error_log with compiler errors.
 
     if not state["modernized_code"].strip():  # This condition checks that we have modernized code to test.
-        print("Tester: skipping because modernized_code is empty.")  # This print explains why the tester is being skipped.
+        logger.info("Tester: skipping because modernized_code is empty.")
         state["is_parity_passed"] = False
         state["is_functionally_equivalent"] = False
         return state
@@ -1253,12 +1258,12 @@ def tester_node(state: ModernizationState) -> ModernizationState:
     original_cpp_path = state.get("source_file") or ""
 
     if not os.path.isfile(original_cpp_path):
-        print(f"Tester: original C++ file not found at {original_cpp_path}, skipping parity test.")  # This print warns that we cannot run the differential test.
+        logger.warning("Tester: original C++ file not found at %s, skipping parity test.", original_cpp_path)
         state["is_parity_passed"] = False
         state["is_functionally_equivalent"] = False
         return state
 
-    print("🧪 Running differential test for functional parity...")  # This print signals that we are about to run the parity test.
+    logger.info("🧪 Running differential test for functional parity...")
     parity_result = run_differential_test(original_cpp_path, state["modernized_code"])
     parity_ok = bool(parity_result.get("parity_ok"))
     diff_text = parity_result.get("diff_text", "")
@@ -1267,11 +1272,11 @@ def tester_node(state: ModernizationState) -> ModernizationState:
     state["is_functionally_equivalent"] = parity_ok  # This line mirrors the parity result into the functionally-equivalent flag.
 
     if parity_ok:
-        print("✅ Parity Test PASSED (outputs match).")  # This print confirms that the modernized code matches the original program output.
+        logger.info("✅ Parity Test PASSED (outputs match).")
         return state
 
     # On parity failure, store the unified diff so the modernizer can fix logic.
-    print("❌ Parity Test FAILED (outputs differ).")  # This print reports that the outputs do not match.
+    logger.warning("❌ Parity Test FAILED (outputs differ).")
     state["diff_output"] = diff_text  # This line stores the unified diff for the modernizer prompt.
     state["error_log"] = diff_text  # This line mirrors the diff into error_log for backward-compatible prompts and logging.
 
@@ -1291,7 +1296,7 @@ def verify_node(state: ModernizationState) -> ModernizationState:
         compiled_state["is_parity_passed"] = True
         compiled_state["is_functionally_equivalent"] = True
         compiled_state["diff_output"] = ""
-        print("Tester: deferred until final function is modernized.")
+        logger.info("Tester: deferred until final function is modernized.")
         return compiled_state
 
     return tester_node(compiled_state)
@@ -1314,12 +1319,12 @@ def surgical_router(state: ModernizationState) -> str:
         current_index = int(state.get("current_function_index", 0))
         modernization_order = state.get("modernization_order") or []
         if current_index < len(modernization_order):
-            print(f"\n🔄 Routing back to MODERNIZER (next function: {modernization_order[current_index]})")
+            logger.info("\n🔄 Routing back to MODERNIZER (next function: %s)", modernization_order[current_index])
             # Reset attempt counter and error log for the next function.
             state["attempt_count"] = 0
             state["error_log"] = ""
             return "modernizer"
-        print("\n🏁 Routing to END (SUCCESS: all functions modernized)")
+        logger.info("\n🏁 Routing to END (SUCCESS: all functions modernized)")
         return "end"
 
     if attempt_count >= 3:
@@ -1331,21 +1336,21 @@ def surgical_router(state: ModernizationState) -> str:
             state["partial_success"] = True
             state["attempt_count"] = 0
             state["error_log"] = ""
-            print(f"\n🔄 Skipping failed function, routing to MODERNIZER (next: {modernization_order[current_index + 1]})")
+            logger.info("\n🔄 Skipping failed function, routing to MODERNIZER (next: %s)", modernization_order[current_index + 1])
             return "modernizer"
         state["partial_success"] = True
-        print("\n🏁 Routing to END (PARTIAL_SUCCESS after max attempts)")
+        logger.info("\n🏁 Routing to END (PARTIAL_SUCCESS after max attempts)")
         return "end"
 
     if attempt_count < 3 and not verification_success:
-        print("\n🔄 Routing back to MODERNIZER (compiler failure, surgical retry)")
+        logger.info("\n🔄 Routing back to MODERNIZER (compiler failure, surgical retry)")
         return "modernizer"
 
     if attempt_count < 3 and not parity_passed:
-        print("\n🔄 Routing back to MODERNIZER (parity failure, surgical retry)")
+        logger.info("\n🔄 Routing back to MODERNIZER (parity failure, surgical retry)")
         return "modernizer"
 
-    print("\n🏁 Routing to END")
+    logger.info("\n🏁 Routing to END")
     return "end"
 
 
@@ -1386,9 +1391,9 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
     """
     Executes the modernization workflow with provided code
     """
-    print("=" * 60)
-    print("🚀 STARTING CODE MODERNIZATION WORKFLOW")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("🚀 STARTING CODE MODERNIZATION WORKFLOW")
+    logger.info("=" * 60)
 
     source_abs = os.path.abspath(source_file) if source_file else ""
     normalized_output_path = os.path.abspath(output_file_path) if output_file_path else ""
@@ -1466,21 +1471,20 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
                 "raw_stderr": final_state.get("verification_result", {}).get("raw_stderr", ""),
             }
             final_state["error_log"] = strict_message
-            print(f"❌ {strict_message}")
+            logger.error("❌ %s", strict_message)
         else:
-            print(
-                "✅ STRICT MODE PASSED: "
-                f"C++23 compliance {compliance_percent}% >= {_STRICT_CPP23_TARGET_PERCENT}%"
+            logger.info(
+                "✅ STRICT MODE PASSED: C++23 compliance %d%% >= %d%%",
+                compliance_percent, _STRICT_CPP23_TARGET_PERCENT
             )
-    
-    # Print final results
-    print("\n" + "=" * 60)
-    print("📊 MODERNIZATION COMPLETE")
-    print("=" * 60)
-    print(f"Language: {final_state['language']}")
-    print(f"Total Attempts: {final_state['attempt_count']}")
-    print(f"Verification Success: {final_state['verification_result'].get('success')}")
-    print(f"\nFinal Modernized Code:\n{final_state['modernized_code']}")
+
+    logger.info("\n" + "=" * 60)
+    logger.info("📊 MODERNIZATION COMPLETE")
+    logger.info("=" * 60)
+    logger.info("Language: %s", final_state['language'])
+    logger.info("Total Attempts: %d", final_state['attempt_count'])
+    logger.info("Verification Success: %s", final_state['verification_result'].get('success'))
+    logger.info("\nFinal Modernized Code:\n%s", final_state['modernized_code'])
 
     # ------------------------------------------------------------------
     # Save modernized code to a separate output file
@@ -1501,9 +1505,9 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
     try:
         with open(output_path, "w", encoding="utf-8") as _out:
             _out.write(final_state["modernized_code"])
-        print(f"\n💾 Modernized code saved to: {output_path}")
+        logger.info("💾 Modernized code saved to: %s", output_path)
     except OSError as _save_err:
-        print(f"\n⚠️  Could not save output file: {_save_err}")
+        logger.warning("Could not save output file: %s", _save_err)
 
     return final_state
 
@@ -1513,16 +1517,16 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
     _test_cpp_path = os.path.join(_base_dir, "test.cpp")  # This line builds the full path to test.cpp in the project root.
 
     if not check_model_health():
-        print(_health_failure_guidance())
+        logger.error(_health_failure_guidance())
         exit(1)
 
-    try:  # This try block attempts to read the contents of test.cpp so we can run the full modernization loop on it.
-        with open(_test_cpp_path, "r", encoding="utf-8") as f:  # This line opens test.cpp for reading as UTF-8 text.
-            cpp_code = f.read()  # This line reads the entire file contents into a string for the workflow.
-        print(f"📄 Loaded test.cpp ({len(cpp_code)} characters)")  # This print confirms the file was loaded and shows its size.
-    except FileNotFoundError:  # This except block runs if test.cpp does not exist at the expected path.
-        print("❌ test.cpp not found at", _test_cpp_path)  # This print tells the user where the script looked for the file.
-        exit(1)  
+    try:
+        with open(_test_cpp_path, "r", encoding="utf-8") as f:
+            cpp_code = f.read()
+        logger.info("📄 Loaded test.cpp (%d characters)", len(cpp_code))
+    except FileNotFoundError:
+        logger.error("❌ test.cpp not found at %s", _test_cpp_path)
+        exit(1)
         
     result = run_modernization_workflow(cpp_code, language="c++23", source_file=_test_cpp_path)  # This line invokes the full workflow (prune -> analyze -> transform -> verify with retries) on the loaded code.
     verification_ok = bool(result.get("verification_result", {}).get("success"))
@@ -1530,4 +1534,4 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
     if not verification_ok and fail_on_verification:
         exit(2)
     if not verification_ok:
-        print("⚠️ Run completed with verification warnings. Set WORKFLOW_FAIL_ON_VERIFICATION=1 to enforce non-zero exit.")
+        logger.warning("Run completed with verification warnings. Set WORKFLOW_FAIL_ON_VERIFICATION=1 to enforce non-zero exit.")

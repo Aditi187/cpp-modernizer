@@ -40,7 +40,12 @@ void process_data() {
     }
 }
 
+#include <iostream>
+using namespace std;
+
 int main() {
-    process_data();
+    int a = 10, b = 20;
+    cout << "a = " << a << ", b = " << b << endl; // Outputs "a = 10, b = 20"
+    
     return 0;
 }
