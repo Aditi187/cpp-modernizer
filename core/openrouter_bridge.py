@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Sequence
 import importlib
 import os
 import threading
@@ -30,7 +30,8 @@ DEFAULT_OPENROUTER_MODELS: tuple[str, ...] = (
 DEFAULT_RETRY_DELAYS: tuple[int, ...] = (1, 2, 4, 8, 16)
 DEFAULT_MAX_TOKENS = 8192
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120
-SHORT_CODE_RESPONSE_THRESHOLD = 200
+DEFAULT_SHORT_CODE_RESPONSE_THRESHOLD = 500
+DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS = 10
 
 CPP_MODERNIZATION_SYSTEM_PROMPT = (
     "You are a Master C++20 Developer. "
@@ -59,6 +60,18 @@ def _parse_int_env(name: str, default: int) -> int:
         return int(raw_value)
     except ValueError:
         return default
+
+
+SHORT_CODE_RESPONSE_THRESHOLD = max(
+    50,
+    _parse_int_env("OPENROUTER_SHORT_RESPONSE_THRESHOLD", DEFAULT_SHORT_CODE_RESPONSE_THRESHOLD),
+)
+ENABLE_HEALTH_PROBE = os.environ.get("OPENROUTER_HEALTH_PROBE", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _dedupe_models(models: Sequence[str]) -> list[str]:
@@ -252,13 +265,21 @@ class LangfuseTracker:
             self._log(f"Failed to start LangFuse span '{name}': {exc!r}")
         return None
 
-    def end_span(self, span: Any, output_payload: Any = None, level: str | None = None) -> None:
+    def end_span(
+        self,
+        span: Any,
+        output_payload: Any = None,
+        level: str | None = None,
+        input_payload: Any = None,
+    ) -> None:
         if span is None:
             return
         try:
             # New SDK commonly expects output/level via update(), then plain end().
             if hasattr(span, "update"):
                 update_kwargs: dict[str, Any] = {}
+                if input_payload is not None:
+                    update_kwargs["input"] = input_payload
                 if output_payload is not None:
                     update_kwargs["output"] = output_payload
                 if level:
@@ -272,6 +293,8 @@ class LangfuseTracker:
                 try:
                     # Legacy SDK path.
                     kwargs: dict[str, Any] = {}
+                    if input_payload is not None:
+                        kwargs["input"] = input_payload
                     if output_payload is not None:
                         kwargs["output"] = output_payload
                     if level:
@@ -293,6 +316,7 @@ class LangfuseTracker:
         total_tokens: int | None,
         system_prompt: str,
     ) -> None:
+        """Capture one LLM generation with explicit input/output and usage details."""
         trace = self.get_or_create_trace()
         if trace is None:
             return
@@ -303,16 +327,46 @@ class LangfuseTracker:
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
         }
+        usage_details = {
+            "prompt_tokens": int(prompt_tokens or 0),
+            "completion_tokens": int(completion_tokens or 0),
+            "total_tokens": int(total_tokens or 0),
+        }
+        generation_input = {"system_prompt": system_prompt, "user_prompt": prompt}
 
         try:
             if hasattr(trace, "generation"):
-                trace.generation(
+                generation = trace.generation(
                     name="OpenRouter-Completion",
                     model=model,
-                    input={"system_prompt": system_prompt, "user_prompt": prompt},
-                    output=response_text,
+                    input=generation_input,
                     metadata=metadata,
                 )
+                if hasattr(generation, "end"):
+                    generation.end(
+                        output=response_text,
+                        model=model,
+                        usage_details=usage_details,
+                        metadata=metadata,
+                    )
+                elif hasattr(generation, "update"):
+                    generation.update(
+                        output=response_text,
+                        model=model,
+                        usage_details=usage_details,
+                        metadata=metadata,
+                    )
+                    if hasattr(generation, "end"):
+                        generation.end()
+                else:
+                    # Fallback for SDK variants where generation(...) records immediately.
+                    trace.generation(
+                        name="OpenRouter-Completion",
+                        model=model,
+                        input=generation_input,
+                        output=response_text,
+                        metadata=metadata,
+                    )
                 return
 
             if hasattr(self._client, "start_observation"):
@@ -320,24 +374,16 @@ class LangfuseTracker:
                     trace_context=self._current_trace_context(),
                     name="OpenRouter-Completion",
                     as_type="generation",
-                    input={"system_prompt": system_prompt, "user_prompt": prompt},
+                    input=generation_input,
                     model=model,
-                    usage_details={
-                        "prompt_tokens": int(prompt_tokens or 0),
-                        "completion_tokens": int(completion_tokens or 0),
-                        "total_tokens": int(total_tokens or 0),
-                    },
+                    usage_details=usage_details,
                     metadata=metadata,
                 )
                 if hasattr(generation, "update"):
                     generation.update(
                         output=response_text,
                         model=model,
-                        usage_details={
-                            "prompt_tokens": int(prompt_tokens or 0),
-                            "completion_tokens": int(completion_tokens or 0),
-                            "total_tokens": int(total_tokens or 0),
-                        },
+                        usage_details=usage_details,
                         metadata=metadata,
                     )
                 if hasattr(generation, "end"):
@@ -390,6 +436,8 @@ class LangfuseTracker:
 
 
 class OpenRouterBridge:
+    """OpenRouter chat-completion bridge with generation-first Langfuse tracing."""
+
     def __init__(
         self,
         config: OpenRouterConfig | None = None,
@@ -404,6 +452,7 @@ class OpenRouterBridge:
         cls,
         log_fn: Callable[[str], None] | None = None,
     ) -> "OpenRouterBridge":
+        """Create a bridge from environment-configured OpenRouter settings."""
         return cls(OpenRouterConfig.from_env(), log_fn=log_fn)
 
     def _log(self, message: str) -> None:
@@ -411,15 +460,30 @@ class OpenRouterBridge:
             self._log_fn(message)
 
     def start_modernization_trace(self, input_payload: Any = None) -> Any:
+        """Start or attach to a modernization trace."""
         return self.tracker.create_trace(name="CPP-Modernization", input_payload=input_payload)
 
     def start_span(self, name: str, input_payload: Any = None) -> Any:
+        """Start a generic span for non-LLM operations."""
         return self.tracker.start_span(name=name, input_payload=input_payload)
 
-    def end_span(self, span: Any, output_payload: Any = None, level: str | None = None) -> None:
-        self.tracker.end_span(span=span, output_payload=output_payload, level=level)
+    def end_span(
+        self,
+        span: Any,
+        output_payload: Any = None,
+        level: str | None = None,
+        input_payload: Any = None,
+    ) -> None:
+        """End a generic span for non-LLM operations."""
+        self.tracker.end_span(
+            span=span,
+            output_payload=output_payload,
+            level=level,
+            input_payload=input_payload,
+        )
 
     def mark_trace_error(self, message: str, details: Any = None) -> None:
+        """Attach an error marker to the active trace."""
         self.tracker.mark_error(message=message, details=details)
 
     def _build_payload(
@@ -429,6 +493,7 @@ class OpenRouterBridge:
         user_prompt: str,
         temperature: float,
     ) -> dict[str, object]:
+        """Build an OpenRouter chat-completions payload."""
         return {
             "model": model_name,
             "messages": [
@@ -439,6 +504,71 @@ class OpenRouterBridge:
             "temperature": temperature,
         }
 
+    def _request_model_with_retries(
+        self,
+        *,
+        model_name: str,
+        payload: dict[str, object],
+    ) -> dict[str, Any]:
+        """Run one model request with retry/backoff for transient failures."""
+        last_exc: Exception | None = None
+        last_error_text = ""
+        for attempt, delay in enumerate(self.config.retry_delays, start=1):
+            try:
+                response = requests.post(
+                    self.config.endpoint,
+                    headers=self.config.headers(),
+                    json=payload,
+                    timeout=self.config.request_timeout_seconds,
+                )
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
+                if attempt < len(self.config.retry_delays):
+                    self._log(
+                        f"Network error contacting OpenRouter for model '{model_name}': {exc}. "
+                        f"Retrying in {delay}s... (attempt {attempt}/{len(self.config.retry_delays)})"
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(
+                    f"OpenRouter network error for model '{model_name}' after retries: {exc!r}"
+                ) from exc
+
+            if response.status_code == 200:
+                return response.json()
+
+            last_error_text = response.text
+            is_rate_limit = response.status_code == 429
+            is_server_error = 500 <= response.status_code < 600
+            if is_rate_limit or is_server_error:
+                if attempt < len(self.config.retry_delays):
+                    error_kind = "rate limited (429)" if is_rate_limit else f"server error {response.status_code}"
+                    wait_seconds = 5 * attempt if is_rate_limit else delay
+                    self._log(
+                        f"OpenRouter {error_kind} for model '{model_name}'. "
+                        f"Retrying in {wait_seconds}s... (attempt {attempt}/{len(self.config.retry_delays)})"
+                    )
+                    time.sleep(wait_seconds)
+                    continue
+                if is_rate_limit:
+                    raise RuntimeError(f"PROVIDER_QUOTA_EXHAUSTED::{model_name}::{response.status_code}")
+                raise RuntimeError(
+                    f"OpenRouter server failure for model '{model_name}' after retries: "
+                    f"{response.status_code} {response.text}"
+                )
+
+            if _looks_like_model_unavailable(response.status_code, response.text):
+                raise RuntimeError(f"MODEL_UNAVAILABLE::{model_name}::{response.status_code}::{response.text}")
+
+            raise RuntimeError(
+                f"OpenRouter returned {response.status_code} for model '{model_name}': {response.text}"
+            )
+
+        raise RuntimeError(
+            f"OpenRouter request failed for model '{model_name}'. "
+            f"Last error: {last_exc!r}. Last response: {last_error_text}"
+        )
+
     def chat_completion(
         self,
         system_prompt: str,
@@ -446,6 +576,10 @@ class OpenRouterBridge:
         temperature: float = 0.2,
         start_new_trace: bool = False,
     ) -> str:
+        """Run a non-streaming chat completion with sequential model fallback.
+
+        Tracing strategy: generation-first. No separate LLM span is created.
+        """
         if not self.config.api_key:
             raise ValueError(
                 "OPENROUTER_API_KEY is empty. Set it in your environment or .env file."
@@ -463,109 +597,84 @@ class OpenRouterBridge:
             self.tracker.get_or_create_trace(name="CPP-Modernization")
 
         enforce_full_response = _expects_large_code_response(user_prompt)
-        prompt_variants = [user_prompt]
+        effective_user_prompt = user_prompt
         if enforce_full_response:
-            prompt_variants.append(f"{user_prompt}\n\n{FULL_RESPONSE_REMINDER}")
+            effective_user_prompt = f"{user_prompt}\n\n{FULL_RESPONSE_REMINDER}"
 
-        last_exc: Exception | None = None
-        last_error_text = ""
+        model_errors: list[str] = []
 
         for model_name in self.config.models:
-            for prompt_index, prompt_variant in enumerate(prompt_variants, start=1):
-                payload = self._build_payload(
-                    model_name=model_name,
+            payload = self._build_payload(
+                model_name=model_name,
+                system_prompt=system_prompt,
+                user_prompt=effective_user_prompt,
+                temperature=temperature,
+            )
+            try:
+                data = self._request_model_with_retries(model_name=model_name, payload=payload)
+                choice = (data.get("choices") or [{}])[0]
+                message = choice.get("message") or {}
+                content = str(message.get("content") or "")
+                finish_reason = str(choice.get("finish_reason") or "")
+
+                usage = data.get("usage") or {}
+                prompt_tokens = usage.get("prompt_tokens")
+                completion_tokens = usage.get("completion_tokens")
+                total_tokens = usage.get("total_tokens")
+
+                self.tracker.capture_generation(
+                    model=model_name,
+                    prompt=effective_user_prompt,
+                    response_text=content,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
                     system_prompt=system_prompt,
-                    user_prompt=prompt_variant,
-                    temperature=temperature,
                 )
 
-                for attempt, delay in enumerate(self.config.retry_delays, start=1):
-                    try:
-                        response = requests.post(
-                            self.config.endpoint,
-                            headers=self.config.headers(),
-                            json=payload,
-                            timeout=self.config.request_timeout_seconds,
-                        )
-                        if response.status_code == 200:
-                            data = response.json()
-                            choice = data["choices"][0]
-                            content = choice["message"]["content"]
-                            finish_reason = choice.get("finish_reason")
+                if finish_reason == "length":
+                    error_msg = (
+                        f"{model_name}: finish_reason=length (response truncated by token limits). "
+                        "Increase OPENROUTER_MAX_TOKENS."
+                    )
+                    model_errors.append(error_msg)
+                    self._log(error_msg)
+                    continue
 
-                            usage = data.get("usage") or {}
-                            prompt_tokens = usage.get("prompt_tokens")
-                            completion_tokens = usage.get("completion_tokens")
-                            total_tokens = usage.get("total_tokens")
+                if enforce_full_response and len(content.strip()) < SHORT_CODE_RESPONSE_THRESHOLD:
+                    error_msg = (
+                        f"{model_name}: response below short threshold "
+                        f"({len(content.strip())} < {SHORT_CODE_RESPONSE_THRESHOLD})."
+                    )
+                    model_errors.append(error_msg)
+                    self._log(error_msg)
+                    continue
 
-                            self.tracker.capture_generation(
-                                model=model_name,
-                                prompt=prompt_variant,
-                                response_text=content,
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                total_tokens=total_tokens,
-                                system_prompt=system_prompt,
-                            )
+                return content
+            except RuntimeError as exc:
+                message = str(exc)
+                if message.startswith("PROVIDER_QUOTA_EXHAUSTED::"):
+                    self.mark_trace_error(
+                        message="PROVIDER_QUOTA_EXHAUSTED",
+                        details={"model": model_name, "error": message},
+                    )
+                    raise RuntimeError("PROVIDER_QUOTA_EXHAUSTED") from exc
 
-                            if finish_reason == "length":
-                                last_error_text = (
-                                    f"Model '{model_name}' stopped because of token limits. "
-                                    "Increase OPENROUTER_MAX_TOKENS."
-                                )
-                                break
+                model_errors.append(f"{model_name}: {message}")
+                self._log(f"Model '{model_name}' failed: {message}. Trying next fallback model...")
+                continue
 
-                            if (
-                                enforce_full_response
-                                and len(content.strip()) < SHORT_CODE_RESPONSE_THRESHOLD
-                                and prompt_index < len(prompt_variants)
-                            ):
-                                self._log(
-                                    f"Model '{model_name}' returned only {len(content.strip())} characters. "
-                                    "Retrying with full-response reminder..."
-                                )
-                                break
-
-                            return content
-
-                        if response.status_code == 429:
-                            self._log(
-                                f"OpenRouter rate limited (429) for model '{model_name}'. "
-                                f"Retrying in {delay}s... (attempt {attempt}/{len(self.config.retry_delays)})"
-                            )
-                        elif 500 <= response.status_code < 600:
-                            self._log(
-                                f"OpenRouter server error {response.status_code} for model '{model_name}'. "
-                                f"Retrying in {delay}s... (attempt {attempt}/{len(self.config.retry_delays)})"
-                            )
-                        else:
-                            last_error_text = response.text
-                            if _looks_like_model_unavailable(response.status_code, response.text):
-                                self._log(
-                                    f"Model '{model_name}' unavailable. Trying next fallback model..."
-                                )
-                                break
-                            raise RuntimeError(
-                                f"OpenRouter returned {response.status_code} for model '{model_name}': {response.text}"
-                            )
-                    except RuntimeError:
-                        raise
-                    except requests.exceptions.RequestException as exc:
-                        last_exc = exc
-                        self._log(
-                            f"Network error contacting OpenRouter for model '{model_name}': {exc}. "
-                            f"Retrying in {delay}s... (attempt {attempt}/{len(self.config.retry_delays)})"
-                        )
-
-                    if attempt < len(self.config.retry_delays):
-                        time.sleep(delay)
-
+        self.mark_trace_error(
+            message="OPENROUTER_CALL_FAILED_ALL_MODELS",
+            details={"models": list(self.config.models), "errors": model_errors},
+        )
         raise RuntimeError(
             "OpenRouter call failed across all configured models. "
-            f"Last error: {last_exc!r}. Last response body: {last_error_text}"
+            f"Per-model errors: {model_errors}"
         )
 
     def check_health(self) -> tuple[bool, str]:
+        """Verify API connectivity and optionally probe configured model inference."""
         if not self.config.api_key:
             return False, "OPENROUTER_API_KEY is empty. Set it in your environment or .env file."
 
@@ -579,6 +688,36 @@ class OpenRouterBridge:
             return False, f"Could not reach OpenRouter: {exc}"
 
         if response.status_code == 200:
-            return True, "OPENROUTER CONNECTION VERIFIED"
+            if not ENABLE_HEALTH_PROBE:
+                return True, "OPENROUTER CONNECTION VERIFIED"
+
+            model_name = self.config.models[0] if self.config.models else ""
+            if not model_name:
+                return False, "OPENROUTER connected but no model is configured."
+
+            probe_payload = self._build_payload(
+                model_name=model_name,
+                system_prompt="Respond with OK.",
+                user_prompt="health-check",
+                temperature=0.0,
+            )
+            probe_payload["max_tokens"] = 1
+            try:
+                probe_response = requests.post(
+                    self.config.endpoint,
+                    headers=self.config.headers(),
+                    json=probe_payload,
+                    timeout=DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS,
+                )
+            except requests.exceptions.RequestException as exc:
+                return False, f"OpenRouter model probe failed: {exc}"
+
+            if probe_response.status_code != 200:
+                return (
+                    False,
+                    f"OpenRouter model probe failed for '{model_name}' "
+                    f"with status {probe_response.status_code}.",
+                )
+            return True, "OPENROUTER CONNECTION + MODEL PROBE VERIFIED"
 
         return False, f"OpenRouter returned status {response.status_code}. Check your API key."

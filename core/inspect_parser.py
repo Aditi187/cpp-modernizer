@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+import hashlib
 import re
+from typing import Dict, List
 
 
 @dataclass(frozen=True)
 class ComplianceRule:
+	"""Single weighted compliance rule used by score_cpp23_compliance.
+
+	Each rule contributes up to weight points based on positive and negative
+	pattern matches on masked source text.
+	"""
+
 	id: str
 	weight: int
 	positive_pattern: re.Pattern[str]
@@ -42,17 +49,10 @@ _RULES: List[ComplianceRule] = [
 	),
 	ComplianceRule(
 		id="ranges_views_pipelines",
-		weight=8,
+		weight=10,
 		positive_pattern=_regex(r"\bstd::(ranges|views)::"),
 		negative_pattern=_regex(r"\bstd::(sort|transform|find|for_each|copy|count|any_of|all_of|none_of)\s*\("),
 		recommendation="Prefer std::ranges/views pipelines where algorithm composition is needed.",
-	),
-	ComplianceRule(
-		id="ranges_algorithms",
-		weight=8,
-		positive_pattern=_regex(r"\bstd::ranges::(sort|transform|find|for_each|copy|count|any_of|all_of|none_of)\b"),
-		negative_pattern=_regex(r"\bstd::(sort|transform|find|for_each|copy|count|any_of|all_of|none_of)\s*\("),
-		recommendation="Use std::ranges algorithms (e.g., std::ranges::sort) when modern alternatives exist.",
 	),
 	ComplianceRule(
 		id="unique_ptr_stack",
@@ -90,6 +90,69 @@ _RULES: List[ComplianceRule] = [
 		recommendation="Prefer constexpr for compile-time evaluable values and functions.",
 	),
 	ComplianceRule(
+		id="consteval_constinit",
+		weight=6,
+		positive_pattern=_regex(r"\b(consteval|constinit)\b"),
+		negative_pattern=_regex(r"\bconstexpr\b"),
+		recommendation="Consider consteval/constinit where immediate evaluation or static initialization is required.",
+	),
+	ComplianceRule(
+		id="concepts_requires",
+		weight=10,
+		positive_pattern=_regex(r"\b(concept\s+[A-Za-z_]\w*\s*=|requires\b)"),
+		negative_pattern=_regex(r"\btemplate\s*<\s*typename\b"),
+		recommendation="Use C++20 concepts/requires clauses for clearer template constraints.",
+	),
+	ComplianceRule(
+		id="coroutines",
+		weight=8,
+		positive_pattern=_regex(r"\b(co_await|co_yield|co_return)\b"),
+		negative_pattern=_regex(r"\b(std::async|std::thread)\b"),
+		recommendation="Use coroutine primitives when asynchronous control flow benefits from suspension/resumption.",
+	),
+	ComplianceRule(
+		id="noexcept_specifier",
+		weight=6,
+		positive_pattern=_regex(r"\bnoexcept\b"),
+		negative_pattern=_regex(r"\bthrow\s*\(\s*\)"),
+		recommendation="Prefer noexcept over legacy dynamic exception specifications.",
+	),
+	ComplianceRule(
+		id="attributes",
+		weight=6,
+		positive_pattern=_regex(r"\[\[(?:nodiscard|maybe_unused|likely|unlikely)\]\]"),
+		negative_pattern=_regex(r"\b__attribute__\b|\bdeclspec\b"),
+		recommendation="Use standard C++ attributes such as [[nodiscard]], [[likely]], and [[maybe_unused]].",
+	),
+	ComplianceRule(
+		id="three_way_comparison",
+		weight=8,
+		positive_pattern=_regex(r"operator\s*<=>"),
+		negative_pattern=_regex(r"operator\s*==|operator\s*<|operator\s*>"),
+		recommendation="Consider operator<=> to simplify and unify comparison operators.",
+	),
+	ComplianceRule(
+		id="designated_initializers",
+		weight=6,
+		positive_pattern=_regex(r"\{\s*\.[A-Za-z_]\w*\s*="),
+		negative_pattern=_regex(r"\bmemset\s*\("),
+		recommendation="Use designated initializers for clearer aggregate initialization where supported.",
+	),
+	ComplianceRule(
+		id="source_location",
+		weight=6,
+		positive_pattern=_regex(r"\bstd::source_location\b"),
+		negative_pattern=_regex(r"\b(__FILE__|__LINE__|__func__)\b"),
+		recommendation="Use std::source_location instead of preprocessor location macros for diagnostics.",
+	),
+	ComplianceRule(
+		id="constant_evaluated",
+		weight=6,
+		positive_pattern=_regex(r"\bstd::is_constant_evaluated\s*\("),
+		negative_pattern=_regex(r"\b#if\s+defined\("),
+		recommendation="Use std::is_constant_evaluated for constexpr-aware branching when appropriate.",
+	),
+	ComplianceRule(
 		id="variant",
 		weight=8,
 		positive_pattern=_regex(r"\bstd::variant\b"),
@@ -113,6 +176,27 @@ _RULES: List[ComplianceRule] = [
 ]
 
 
+_MASK_NON_CODE_RE = re.compile(
+	r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'",
+	re.DOTALL,
+)
+
+_SCORE_CACHE: Dict[str, Dict[str, object]] = {}
+
+
+def _mask_non_code(source_code: str) -> str:
+	"""Mask comments and string literals to reduce regex false positives.
+
+	This is a heuristic and not a full lexer. It intentionally preserves text
+	length and newlines so match offsets remain stable if needed.
+	"""
+
+	def _blank(match: re.Match[str]) -> str:
+		return re.sub(r"[^\n]", " ", match.group(0))
+
+	return _MASK_NON_CODE_RE.sub(_blank, source_code)
+
+
 def _compute_grade(percent: int) -> str:
 	if percent >= 90:
 		return "A"
@@ -133,16 +217,10 @@ def _build_modernization_suggestions(details: List[Dict[str, object]]) -> List[s
 		recommendation = str(item.get("recommendation") or "").strip()
 		if not recommendation:
 			continue
-		positive = bool(item.get("positive_detected", False))
 		legacy = bool(item.get("legacy_detected", False))
-		raw_score = item.get("score", 0)
-		if isinstance(raw_score, (int, float)):
-			rule_score = int(raw_score)
-		else:
-			rule_score = 0
 
-		# Suggest improvements when legacy patterns exist or the rule has no score yet.
-		if legacy or (not positive and rule_score == 0):
+		# Suggestions are shown only when legacy usage was actually detected.
+		if legacy:
 			if recommendation not in seen:
 				seen.add(recommendation)
 				suggestions.append(recommendation)
@@ -151,19 +229,40 @@ def _build_modernization_suggestions(details: List[Dict[str, object]]) -> List[s
 
 
 def score_cpp23_compliance(source_code: str) -> Dict[str, object]:
+	"""Score C++ source code for C++23 compliance using weighted heuristic rules.
+
+	Limitations:
+	- Pattern matching is regex-based and not AST/lexer perfect.
+	- Comments and string literals are masked heuristically to reduce false
+	  positives, but edge cases may still exist.
+
+	Returns:
+	- score: total weighted points achieved
+	- max_score: maximum possible points
+	- percent: integer percentage
+	- grade: A-F bucket
+	- suggestions: deduplicated recommendations for detected legacy patterns
+	- details: per-rule detection and scoring breakdown
+	"""
+	cache_key = hashlib.sha256(source_code.encode("utf-8")).hexdigest()
+	cached = _SCORE_CACHE.get(cache_key)
+	if cached is not None:
+		return dict(cached)
+
+	code_for_matching = _mask_non_code(source_code)
 	total_weight = sum(rule.weight for rule in _RULES)
 	score = 0
 	details: List[Dict[str, object]] = []
 
 	for rule in _RULES:
-		positive = bool(rule.positive_pattern.search(source_code))
-		negative = bool(rule.negative_pattern.search(source_code))
+		positive = bool(rule.positive_pattern.search(code_for_matching))
+		negative = bool(rule.negative_pattern.search(code_for_matching))
 
 		rule_score = 0
 		if positive and not negative:
 			rule_score = rule.weight
 		elif positive and negative:
-			rule_score = max(1, rule.weight // 2)
+			rule_score = rule.weight // 2
 
 		score += rule_score
 		details.append(
@@ -180,7 +279,7 @@ def score_cpp23_compliance(source_code: str) -> Dict[str, object]:
 	percent = int(round((score / total_weight) * 100)) if total_weight > 0 else 0
 	grade = _compute_grade(percent)
 	suggestions = _build_modernization_suggestions(details)
-	return {
+	result = {
 		"score": score,
 		"max_score": total_weight,
 		"percent": percent,
@@ -188,3 +287,5 @@ def score_cpp23_compliance(source_code: str) -> Dict[str, object]:
 		"suggestions": suggestions,
 		"details": details,
 	}
+	_SCORE_CACHE[cache_key] = dict(result)
+	return result

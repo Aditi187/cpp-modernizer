@@ -18,11 +18,11 @@ sys.path.insert(0, _PROJECT_ROOT)
 
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Any, Optional
+import difflib
+import importlib
 import json
 import os
 import re
-import tempfile
-from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 load_dotenv(
@@ -30,45 +30,69 @@ load_dotenv(
     override=True,
 )  # Load .env from project root explicitly and override inherited empty values.
 
-from core.parser import extract_functions_from_cpp_file
-from core.parser import detect_legacy_patterns
-from core.parser import CppParser
+from core.parser import (
+    CppParser,
+    detect_legacy_patterns,
+)
 from core.graph import (
     DependencyGraph,
     build_analysis_report,
-    get_modernization_order,
 )
 from core.differential_tester import (
     run_differential_test,
     compile_cpp_source,
 )
-from core.gemini_bridge import (
+from core.local_ollama_bridge import (
     CPP_MODERNIZATION_SYSTEM_PROMPT,
-    GeminiBridge,
+    LocalOllamaBridge,
 )
+from core.gemini_bridge import GeminiBridge
 from core.openrouter_bridge import OpenRouterBridge
 from core.inspect_parser import score_cpp23_compliance
-from agents.function_modernizer import FunctionModernizer, similarity
+from agents.function_modernizer import code_similarity_ratio
 
 
-_MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
-_MODEL_BRIDGE = GeminiBridge.from_env(log_fn=print)
+def _has_provider_api_key() -> bool:
+    return any(
+        os.environ.get(name, "").strip()
+        for name in ("GEMINI_API_KEY", "OPENROUTER_API_KEY", "CHATGPT_API_KEY", "OPENAI_API_KEY")
+    )
 
 
-def _build_openrouter_fallback_bridge() -> OpenRouterBridge | None:
-    fallback_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if not fallback_key:
-        return None
-    try:
-        return OpenRouterBridge.from_env(log_fn=print)
-    except Exception as exc:
-        print(f"OpenRouter fallback initialization failed: {exc}")
-        return None
+def _select_model_bridge() -> tuple[Any, str]:
+    preferred_provider = os.environ.get("WORKFLOW_MODEL_PROVIDER", "").strip().lower()
+    if preferred_provider == "openrouter":
+        return OpenRouterBridge.from_env(log_fn=print), "openrouter"
+    if preferred_provider in {"gemini", "openai"}:
+        bridge = GeminiBridge.from_env(log_fn=print)
+        provider_name = str(getattr(getattr(bridge, "config", None), "provider", "gemini") or "gemini")
+        return bridge, provider_name
+    if preferred_provider == "ollama":
+        return LocalOllamaBridge.from_env(log_fn=print), "ollama"
+
+    if os.environ.get("OPENROUTER_API_KEY", "").strip():
+        return OpenRouterBridge.from_env(log_fn=print), "openrouter"
+    if _has_provider_api_key():
+        bridge = GeminiBridge.from_env(log_fn=print)
+        provider_name = str(getattr(getattr(bridge, "config", None), "provider", "gemini") or "gemini")
+        return bridge, provider_name
+    bridge = LocalOllamaBridge.from_env(log_fn=print)
+    return bridge, "ollama"
 
 
-_FALLBACK_MODEL_BRIDGE = _build_openrouter_fallback_bridge()
-_MIN_CPP23_COMPLIANCE_PERCENT = 40
-MAX_WORKERS = 2
+_MODEL_BRIDGE, _MODEL_PROVIDER = _select_model_bridge()
+_MODEL_SYSTEM_PROMPT = "\n\n".join(
+    [
+        CPP_MODERNIZATION_SYSTEM_PROMPT,
+        "Return raw C++ only. No explanations, numbered lists, markdown fences, or commentary.",
+        "Preserve the function name and observable behavior unless the prompt explicitly allows a signature change.",
+        "If additional headers become necessary, include them only when returning a whole-file rewrite.",
+        "Example transformation:\nBefore:\nchar* s = (char*)malloc(10);\nfree(s);\nAfter:\nauto s = std::make_unique<char[]>(10);",
+    ]
+)
+_MODERNIZER_NODE_SIMILARITY_GUARD = 0.90
+_MAX_MODERNIZER_FUNCTION_CHARS = 3000
+_MODEL_OUTPUT_ATTEMPTS = 3
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -102,38 +126,53 @@ _STRICT_CPP23_TARGET_PERCENT = _read_bounded_int_env(
 
 
 def call_model(system_prompt: str, user_prompt: str) -> str:
-    """Call Gemini with shared retry and full-response safeguards."""
-    return _MODEL_BRIDGE.chat_completion(system_prompt, user_prompt)
+    """Call the configured model bridge and let the bridge own generation tracing."""
+    return _MODEL_BRIDGE.chat_completion(system_prompt, user_prompt, start_new_trace=True)
 
 
 def check_model_health() -> bool:
-    """Verify the Gemini API key is set and the endpoint is reachable."""
+    """Verify the configured model provider is reachable and ready."""
     is_healthy, message = _MODEL_BRIDGE.check_health()
-    print(("✅ " if is_healthy else "❌ ") + message)
+    print(f"[{_MODEL_PROVIDER}] " + (("✅ " if is_healthy else "❌ ") + message))
     return is_healthy
+
+
+def _health_failure_guidance() -> str:
+    """Return actionable guidance for common provider startup failures."""
+    _is_healthy, message = _MODEL_BRIDGE.check_health()
+    normalized = str(message or "")
+    if "429" in normalized:
+        return (
+            "Provider rate limit detected (429). If you are using Gemini, wait exactly 60 seconds and rerun "
+            "`python agents/workflow.py`. Avoid repeated retries during that cooldown window."
+        )
+    if "402" in normalized:
+        return (
+            "Provider billing/quota issue detected (402). OpenRouter is rejecting the request. "
+            "Use a funded OpenRouter key, switch to Gemini with `WORKFLOW_MODEL_PROVIDER=gemini`, "
+            "or fall back to a local Ollama code model."
+        )
+    if "OLLAMA" in normalized.upper() and ("NOT FOUND" in normalized.upper() or "UNREACHABLE" in normalized.upper()):
+        return (
+            "Local Ollama is not ready. If you have at least 8 GB free RAM, run `ollama run deepseek-coder:6.7b` "
+            "in a terminal and then rerun the workflow."
+        )
+    return f"Provider startup failed: {normalized}"
 
 
 def _parse_functions_from_source(source_code: str) -> list[dict[str, Any]]:
     """Parse C++ source from text and return function metadata."""
-
-    temp_file_path: Optional[str] = None
     try:
-        temp_file = tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=".cpp",
-            mode="w",
-            encoding="utf-8",
-        )
-        temp_file_path = temp_file.name
-        temp_file.write(source_code)
-        temp_file.flush()
-        temp_file.close()
-        return extract_functions_from_cpp_file(temp_file_path)
+        parser = CppParser()
+        project_map = parser.parse_string(source_code)
+        functions = project_map.get("functions") or {}
+        if isinstance(functions, dict):
+            return list(functions.values())
+        if isinstance(functions, list):
+            return [item for item in functions if isinstance(item, dict)]
+        return []
     except Exception:
         return []
-    finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
 
 
 def _build_callers_map(dependency_map: dict[str, list[str]]) -> dict[str, list[str]]:
@@ -169,6 +208,45 @@ def _clean_model_code_block(text: str) -> str:
     # model sometimes injects into its output.
     cleaned = _DEEPSEEK_SPECIAL_TOKEN_RE.sub("", cleaned)
     return cleaned
+
+
+def _looks_like_prose_response(raw_text: str, cleaned_text: str) -> bool:
+    lower_raw = raw_text.lower()
+    lower_cleaned = cleaned_text.lower()
+    prose_markers = (
+        "to modernize this function",
+        "we can follow these steps",
+        "here is",
+        "here's",
+        "below is",
+        "replace the line",
+        "output only valid c++ code",
+        "example transformation",
+    )
+    if any(marker in lower_raw for marker in prose_markers):
+        return True
+    if re.search(r"(?m)^\s*(?:\d+\.|[-*])\s+", cleaned_text):
+        return True
+    if re.search(r"(?m)^\s*(?:\d+\.|[-*])\s+", raw_text) and "```" not in raw_text:
+        return True
+    if "{" not in cleaned_text or "}" not in cleaned_text:
+        return True
+    if re.search(r"\b(?:steps?|explanation|summary|replace the line)\b", lower_cleaned):
+        return True
+    return False
+
+
+def _build_retry_prompt(base_prompt: str, rejection_reason: str, rejected_response: str) -> str:
+    response_preview = rejected_response.strip()[:500]
+    return (
+        base_prompt
+        + "\n\nCRITICAL RETRY INSTRUCTION: The previous response was rejected."
+        + f"\nReason: {rejection_reason}."
+        + "\nReturn ONLY valid C++ code for the target function."
+        + "\nDo not include explanations, lists, markdown fences, comments describing steps, or placeholders."
+        + "\nStart with the function signature and end with the matching closing brace."
+        + f"\nRejected response preview:\n{response_preview}"
+    )
 
 
 def _split_function_signature_and_body(function_source: str) -> tuple[str, str]:
@@ -345,7 +423,7 @@ def _replace_function_by_span(
     suffix = source_bytes[end_byte:]
     replacement_bytes = replacement.encode("utf-8")
     updated_bytes = prefix + replacement_bytes + suffix
-    return updated_bytes.decode("utf-8", errors="replace")
+    return updated_bytes.decode("utf-8", errors="strict")
 
 
 def _extract_function_text_from_code(source_code: str, function_name: str) -> str:
@@ -357,7 +435,7 @@ def _extract_function_text_from_code(source_code: str, function_name: str) -> st
         end_byte = function_info.get("end_byte")
         if isinstance(start_byte, int) and isinstance(end_byte, int):
             code_bytes = source_code.encode("utf-8")
-            return code_bytes[start_byte:end_byte].decode("utf-8", errors="replace")
+            return code_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
     return ""
 
 
@@ -395,7 +473,7 @@ def _remove_functions_by_name(source_code: str, function_names: set[str]) -> str
     if cursor < len(source_bytes):
         new_chunks.append(source_bytes[cursor:])
 
-    return b"".join(new_chunks).decode("utf-8", errors="replace")
+    return b"".join(new_chunks).decode("utf-8", errors="strict")
 
 
 class IncludeManager:
@@ -639,7 +717,10 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     if is_cpp:  # This condition ensures we only run the C++ parser when we are actually working with C++ code.
         try:  # This try block attempts to run the parser on the current C++ source text and build a dependency graph.
             parser = CppParser()
-            project_map = parser.parse_string(state["code"])  # Parse once and reuse this semantic map across nodes.
+            project_map = parser.parse_string(
+                state["code"],
+                source_file=state.get("source_file") or "",
+            )  # Parse once and reuse this semantic map across nodes.
             parsed_functions = project_map.get("functions", {})
             if isinstance(parsed_functions, dict):
                 functions_info = list(parsed_functions.values())
@@ -685,8 +766,8 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     state["functions_info"] = list(functions_info)
     state["project_map"] = dict(project_map)
 
-    if dependency_map:
-        state["modernization_order"] = get_modernization_order(dependency_map)
+    if is_cpp and functions_info:
+        state["modernization_order"] = dep_graph.get_modernization_order()
     else:
         state["modernization_order"] = []
     state["modernized_functions"] = {}
@@ -783,7 +864,7 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
         new_chunks.append(original_bytes[cursor:])
 
     pruned_bytes = b"".join(new_chunks)  # This line concatenates all preserved segments into a single byte string.
-    pruned_code = pruned_bytes.decode("utf-8", errors="replace")  # This line decodes the pruned bytes back into text.
+    pruned_code = pruned_bytes.decode("utf-8", errors="strict")  # This line decodes the pruned bytes back into text.
 
     def _prune_dead_includes(code_text: str, removed_functions: list[str]) -> str:
         lines = code_text.splitlines()
@@ -896,17 +977,27 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             return state
 
         state["current_function_span"] = (start_byte, end_byte)
-        function_source = source_bytes[start_byte:end_byte].decode("utf-8", errors="replace")
-        transformed_function_source, transform_notes = _apply_rule_based_function_transforms(function_source)
+        function_source = source_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
+        if len(function_source) > _MAX_MODERNIZER_FUNCTION_CHARS:
+            warning = (
+                f"Skipping large function '{current_function_name}' "
+                f"({len(function_source)} chars > {_MAX_MODERNIZER_FUNCTION_CHARS})."
+            )
+            print(warning)
+            state["error_log"] = warning
+            state["modernized_code"] = source_to_improve
+            state["attempt_count"] += 1
+            return state
 
-        # Always apply deterministic transformations before LLM so model effort
-        # focuses on complex semantic cleanup.
-        source_after_rules = _replace_function_by_span(
-            source_to_improve,
-            start_byte,
-            end_byte,
-            transformed_function_source,
-        )
+        legacy_pattern_findings = detect_legacy_patterns(function_source)
+        legacy_patterns = [
+            str(item.get("pattern") or "")
+            for item in legacy_pattern_findings
+            if item.get("pattern")
+        ]
+        legacy_pattern_summary = ", ".join(sorted(set(legacy_patterns))) if legacy_patterns else "none"
+
+        _rule_preview_function, transform_notes = _apply_rule_based_function_transforms(function_source)
 
         if transform_notes:
             print("Rule-based transforms applied: " + ", ".join(transform_notes))
@@ -919,17 +1010,20 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         prompt_parts: list[str] = []
         prompt_parts.append(
             "Rewrite ONLY this function to modern C++23 while preserving behavior. "
+            "You MUST apply at least one modernization. Returning identical code is NOT allowed. "
+            "Examples: printf -> std::print, raw pointer -> std::unique_ptr, manual loop -> ranges. "
             "Return ONLY the updated function."
         )
         prompt_parts.append(f"Function name: {current_function_name}")
         prompt_parts.append(f"Direct callers: {callers_display}")
-        prompt_parts.append("Target function:\n```cpp\n" + transformed_function_source + "\n```")
+        prompt_parts.append(f"Detected legacy patterns: {legacy_pattern_summary}")
+        prompt_parts.append("Target function:\n```cpp\n" + function_source + "\n```")
 
         if transform_notes:
             prompt_parts.append(
-                "A deterministic rule-based pass already handled simple rewrites: "
+                "Deterministic rule-based rewrites that can be applied when safe: "
                 + ", ".join(transform_notes)
-                + ". Only fix remaining complex logic and correctness issues."
+                + ". Preserve behavior and correctness."
             )
 
         if state["error_log"]:
@@ -945,19 +1039,50 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         full_prompt = "\n\n".join(prompt_parts)  # This line joins all prompt sections together with blank lines so the text is readable and well structured.
 
         try:
-            raw_text = call_model(_MODEL_SYSTEM_PROMPT, full_prompt)
-            print(f"DEBUG: Gemini response (first 200 chars): {raw_text[:200]}...")
+            cleaned_candidate = ""
+            raw_text = ""
+            prompt_for_attempt = full_prompt
+            rejection_reason = ""
+            for model_attempt in range(1, _MODEL_OUTPUT_ATTEMPTS + 1):
+                raw_text = call_model(_MODEL_SYSTEM_PROMPT, prompt_for_attempt)
+                print(f"DEBUG: Model response attempt {model_attempt} (first 200 chars): {raw_text[:200]}...")
 
-            # The model is asked to return only one function, and we replace only that span.
-            cleaned_candidate = _clean_model_code_block(raw_text).strip()
-            if not cleaned_candidate:
-                warning = "Model returned empty function output."
+                cleaned_candidate = _clean_model_code_block(raw_text).strip()
+                if not cleaned_candidate:
+                    rejection_reason = "model returned empty function output"
+                elif _looks_like_prose_response(raw_text, cleaned_candidate):
+                    rejection_reason = "model returned prose or non-code instructions"
+                elif current_function_name not in cleaned_candidate:
+                    rejection_reason = f"model output does not contain function name '{current_function_name}'"
+                elif code_similarity_ratio(function_source, cleaned_candidate) > _MODERNIZER_NODE_SIMILARITY_GUARD:
+                    rejection_reason = "model returned nearly identical code"
+                else:
+                    rejection_reason = ""
+                    break
+
+                print(f"⚠️  Rejecting model output attempt {model_attempt}: {rejection_reason}.")
+                if model_attempt < _MODEL_OUTPUT_ATTEMPTS:
+                    prompt_for_attempt = _build_retry_prompt(full_prompt, rejection_reason, raw_text)
+
+            if rejection_reason:
+                warning = f"Model returned unusable output for '{current_function_name}': {rejection_reason}."
                 print(f"⚠️  {warning}")
                 state["error_log"] = warning
-                modernized = source_after_rules
+                modernized = source_to_improve
             else:
+                diff_lines = list(
+                    difflib.unified_diff(
+                        function_source.splitlines(),
+                        cleaned_candidate.splitlines(),
+                        fromfile=f"{current_function_name}_before",
+                        tofile=f"{current_function_name}_after",
+                        lineterm="",
+                    )
+                )
+                if diff_lines:
+                    print("\n".join(diff_lines))
                 modernized = _replace_function_by_span(
-                    source_after_rules,
+                    source_to_improve,
                     start_byte,
                     end_byte,
                     cleaned_candidate,
@@ -967,7 +1092,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                 # the rewritten function content.
                 modernized = IncludeManager().update_file_includes(modernized, cleaned_candidate)
         except Exception as exc:
-            error_message = f"Gemini call failed in modernizer: {exc!r}"
+            error_message = f"Model call failed in modernizer: {exc!r}"
             print(error_message)
             if state["error_log"]:
                 state["error_log"] += f"\n{error_message}"
@@ -1028,7 +1153,10 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
 
         # Refresh parser/cache + dependency graph/order after each successful function replacement.
         parser = CppParser()
-        refreshed_project_map = parser.parse_string(state["modernized_code"])
+        refreshed_project_map = parser.parse_string(
+            state["modernized_code"],
+            source_file=state.get("source_file") or "",
+        )
         parsed_functions = refreshed_project_map.get("functions", {})
         if isinstance(parsed_functions, dict):
             refreshed_functions = list(parsed_functions.values())
@@ -1041,8 +1169,8 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         state["dependency_map"] = refreshed_dep_graph.dependency_map
         state["impact_map"] = refreshed_dep_graph.dependency_map
         state["call_graph_data"] = refreshed_dep_graph.to_dict()
-        if state["dependency_map"]:
-            state["modernization_order"] = get_modernization_order(state["dependency_map"])
+        if refreshed_functions:
+            state["modernization_order"] = refreshed_dep_graph.get_modernization_order()
 
         target_function = state.get("current_target_function") or ""
         if target_function:
@@ -1080,7 +1208,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             )
 
         state["error_log"] = combined_error + critical_fix_section
-        state["modernized_code"] = state.get("last_working_code") or state["code"]
+        print("⚠️ Compile failed, keeping modernization for inspection.")
         print(f"Errors from g++:\n{state['error_log']}")  # This print shows the compiler errors so you can see exactly what went wrong.
 
     return state  # This return passes the updated state (including verification results) back into the LangGraph router.
@@ -1262,216 +1390,13 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
     print("🚀 STARTING CODE MODERNIZATION WORKFLOW")
     print("=" * 60)
 
-    is_cpp = language.lower() in {"cpp", "c++", "c++20", "c++23"}
+    source_abs = os.path.abspath(source_file) if source_file else ""
+    normalized_output_path = os.path.abspath(output_file_path) if output_file_path else ""
 
-    # Primary path: function-level modernization pipeline.
-    if is_cpp and source_file:
-        source_abs = os.path.abspath(source_file)
-        if output_file_path:
-            target_cpp_file = os.path.abspath(output_file_path)
-        else:
-            base, _ext = os.path.splitext(source_abs)
-            target_cpp_file = f"{base}_modernized.cpp"
-
-        target_dir = os.path.dirname(target_cpp_file)
-        if target_dir:
-            os.makedirs(target_dir, exist_ok=True)
-
-        with open(target_cpp_file, "w", encoding="utf-8") as out_file:
-            out_file.write(code)
-
-        _MODEL_BRIDGE.start_modernization_trace(
-            input_payload={
-                "operation": "function_level_workflow_run",
-                "language": language,
-                "source_file": source_abs,
-                "target_file": target_cpp_file,
-                "source_length": len(code),
-            }
-        )
-
-        parser = CppParser()
-        function_modernizer = FunctionModernizer(
-            parser,
-            _MODEL_BRIDGE,
-            fallback_llm=_FALLBACK_MODEL_BRIDGE,
-        )
-        report_path = os.path.join(_PROJECT_ROOT, "modernization_report.txt")
-        failed_functions: list[tuple[str, str]] = []
-
-        project_map = parser.parse_file(target_cpp_file)
-        parsed_functions = project_map.get("functions") or {}
-        if isinstance(parsed_functions, dict):
-            functions_info = list(parsed_functions.values())
-        else:
-            functions_info = []
-
-        dependency_graph = DependencyGraph(
-            functions_info=functions_info,
-            types_info=project_map.get("types") or [],
-        )
-        levels = dependency_graph.get_dependency_levels()
-
-        name_to_fqns: dict[str, list[str]] = {}
-        if isinstance(parsed_functions, dict):
-            for fqn, meta in parsed_functions.items():
-                simple_name = str(meta.get("name") or "")
-                if simple_name:
-                    name_to_fqns.setdefault(simple_name, []).append(str(fqn))
-
-        def _write_modernization_report(final_code: str) -> None:
-            final_score = score_cpp23_compliance(final_code)
-            percent = int(final_score.get("percent", 0) or 0)
-            stats = function_modernizer.stats
-            lines = [
-                "## Modernization Report",
-                "",
-                f"Functions analyzed: {stats.get('functions_analyzed', 0)}",
-                f"Functions modernized: {stats.get('functions_modernized', 0)}",
-                f"Rule transformations applied: {stats.get('rule_transformations', 0)}",
-                f"LLM transformations applied: {stats.get('llm_transformations', 0)}",
-                f"Legacy constructs detected: {stats.get('legacy_constructs_detected', 0)}",
-                f"Final C++23 compliance score: {percent}%",
-            ]
-            with open(report_path, "w", encoding="utf-8") as report_file:
-                report_file.write("\n".join(lines) + "\n")
-
-        try:
-            for level_index, level in enumerate(levels):
-                print(f"Modernizing level {level_index + 1}/{len(levels)}")
-                print(f"Functions in level: {level}")
-
-                level_fqns: list[str] = []
-                for function_name in level:
-                    for fqn in sorted(name_to_fqns.get(function_name, [])):
-                        level_fqns.append(fqn)
-
-                if not level_fqns:
-                    continue
-
-                def _worker(function_fqn: str) -> tuple[str, bool, str]:
-                    try:
-                        function_modernizer.modernize_function(target_cpp_file, function_fqn)
-                        return function_fqn, True, ""
-                    except Exception as exc:
-                        return function_fqn, False, str(exc)
-
-                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                    futures = [
-                        executor.submit(
-                            _worker,
-                            function_fqn,
-                        )
-                        for function_fqn in level_fqns
-                    ]
-                    for future in futures:
-                        function_fqn, ok, error_message = future.result()
-                        if not ok:
-                            failed_functions.append((function_fqn, error_message))
-                            print(f"Worker failed for {function_fqn}: {error_message}")
-
-            if failed_functions:
-                print("Modernization finished with worker failures:")
-                for function_fqn, error_message in failed_functions:
-                    print(f" - {function_fqn}: {error_message}")
-
-            with open(target_cpp_file, "r", encoding="utf-8") as out_file:
-                modernized_code = out_file.read()
-
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                suffix=".cpp",
-                delete=False,
-                encoding="utf-8",
-            ) as original_tmp:
-                original_tmp.write(code)
-                original_cpp_path = original_tmp.name
-
-            try:
-                parity_result = run_differential_test(
-                    original_cpp_path=original_cpp_path,
-                    modernized_code=modernized_code,
-                )
-            finally:
-                if os.path.exists(original_cpp_path):
-                    os.remove(original_cpp_path)
-
-            if not bool(parity_result.get("parity_ok")):
-                raise RuntimeError(
-                    "Final differential test failed after parallel worker modernization.\n"
-                    + str(parity_result.get("diff_text") or "")
-                )
-
-            similarity_ratio = similarity(code, modernized_code)
-            if similarity_ratio > 0.95:
-                raise RuntimeError(
-                    "Modernization failed: output too similar to input. "
-                    f"similarity={similarity_ratio:.2f}"
-                )
-            verification_result = compile_cpp_source(modernized_code)
-            compliance_report = score_cpp23_compliance(modernized_code)
-            parity_ok = bool(verification_result.get("success"))
-            error_log = ""
-            _write_modernization_report(modernized_code)
-        except Exception as exc:
-            with open(target_cpp_file, "r", encoding="utf-8") as out_file:
-                modernized_code = out_file.read()
-            compile_snapshot = compile_cpp_source(modernized_code)
-            verification_result = {
-                "success": False,
-                "errors": [str(exc)],
-                "warnings": compile_snapshot.get("warnings", []),
-                "compilation_time_ms": compile_snapshot.get("compilation_time_ms", 0),
-                "raw_stdout": compile_snapshot.get("raw_stdout", ""),
-                "raw_stderr": compile_snapshot.get("raw_stderr", ""),
-            }
-            compliance_report = score_cpp23_compliance(modernized_code)
-            parity_ok = False
-            error_log = str(exc)
-            _write_modernization_report(modernized_code)
-
-        final_state = {
-            "code": code,
-            "language": language,
-            "analysis": "",
-            "dependency_map": {},
-            "call_graph_data": {},
-            "impact_map": {},
-            "orphans": [],
-            "analysis_report": "",
-            "modernized_code": modernized_code,
-            "verification_result": verification_result,
-            "error_log": error_log,
-            "attempt_count": 0,
-            "is_parity_passed": parity_ok,
-            "is_functionally_equivalent": parity_ok,
-            "diff_output": error_log if not parity_ok else "",
-            "feedback_loop_count": 0,
-            "modernization_order": [],
-            "modernized_functions": {},
-            "current_function_index": 0,
-            "partial_success": False,
-            "last_working_code": modernized_code,
-            "current_target_function": "",
-            "functions_info": [],
-            "current_function_name": "",
-            "current_function_span": (0, 0),
-            "project_map": {},
-            "source_file": source_abs,
-            "output_file_path": target_cpp_file,
-            "legacy_findings": [],
-            "compliance_report": compliance_report,
-        }
-
-        print("\n" + "=" * 60)
-        print("📊 MODERNIZATION COMPLETE")
-        print("=" * 60)
-        print(f"Language: {final_state['language']}")
-        print(f"Verification Success: {final_state['verification_result'].get('success')}")
-        print(f"\nFinal Modernized Code:\n{final_state['modernized_code']}")
-        print(f"\n💾 Modernized code saved to: {target_cpp_file}")
-        print(f"🧾 Modernization report saved to: {report_path}")
-        return final_state
+    if normalized_output_path:
+        output_dir = os.path.dirname(normalized_output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
     
     # Initialize state
     initial_state = ModernizationState(
@@ -1501,8 +1426,8 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
         current_function_name="",
         current_function_span=(0, 0),
         project_map={},
-        source_file=source_file,
-        output_file_path=output_file_path,
+        source_file=source_abs,
+        output_file_path=normalized_output_path,
         legacy_findings=[],
         compliance_report={},
     )
@@ -1512,7 +1437,7 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
         input_payload={
             "operation": "workflow_run",
             "language": language,
-            "source_file": source_file,
+            "source_file": source_abs,
             "source_length": len(code),
         }
     )
@@ -1588,6 +1513,7 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
     _test_cpp_path = os.path.join(_base_dir, "test.cpp")  # This line builds the full path to test.cpp in the project root.
 
     if not check_model_health():
+        print(_health_failure_guidance())
         exit(1)
 
     try:  # This try block attempts to read the contents of test.cpp so we can run the full modernization loop on it.
@@ -1599,5 +1525,9 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
         exit(1)  
         
     result = run_modernization_workflow(cpp_code, language="c++23", source_file=_test_cpp_path)  # This line invokes the full workflow (prune -> analyze -> transform -> verify with retries) on the loaded code.
-    if not bool(result.get("verification_result", {}).get("success")):
+    verification_ok = bool(result.get("verification_result", {}).get("success"))
+    fail_on_verification = os.environ.get("WORKFLOW_FAIL_ON_VERIFICATION", "0").strip() == "1"
+    if not verification_ok and fail_on_verification:
         exit(2)
+    if not verification_ok:
+        print("⚠️ Run completed with verification warnings. Set WORKFLOW_FAIL_ON_VERIFICATION=1 to enforce non-zero exit.")

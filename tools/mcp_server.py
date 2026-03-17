@@ -1,10 +1,11 @@
-import os
+﻿import os
 import shlex
 import subprocess
 import re
 import glob
 import json
 import sys
+from pathlib import Path
 # Force UTF-8 output on Windows to prevent UnicodeEncodeError with emoji characters.
 stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
 if callable(stdout_reconfigure):
@@ -61,12 +62,29 @@ _IGNORED_DIRS: set[str] = {
 _ALLOWED_COMPILERS: set[str] = {
     "g++", "gcc", "c++", "cc",
     "clang++", "clang",
-    "make", "cmake", "ninja",
 }
 
-_RUN_COMPILER_TIMEOUT_SECONDS = 30
-_SEARCH_MAX_FILES_SCANNED = 2000
-_MAX_BINARY_OUTPUT_CHARS = 10_000
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+_RUN_COMPILER_TIMEOUT_SECONDS = _env_int("MCP_RUN_COMPILER_TIMEOUT_SECONDS", 30, 1)
+_SEARCH_MAX_FILES_SCANNED = _env_int("MCP_SEARCH_MAX_FILES_SCANNED", 2000, 1)
+_MAX_BINARY_OUTPUT_CHARS = _env_int("MCP_MAX_BINARY_OUTPUT_CHARS", 10_000, 256)
+_GLOBAL_CACHE_MAX_TYPES = _env_int("MCP_GLOBAL_CACHE_MAX_TYPES", 8000, 100)
+_TYPE_BUNDLE_MAX_DEF_CHARS = _env_int("MCP_TYPE_BUNDLE_MAX_DEF_CHARS", 2000, 200)
+_TYPE_BUNDLE_INCLUDE_FULL_SOURCE = os.environ.get("MCP_TYPE_BUNDLE_INCLUDE_FULL_SOURCE", "0").strip().lower() in {"1", "true", "yes", "on"}
+_ALLOW_RUN_BINARY = os.environ.get("MCP_ALLOW_RUN_BINARY", "0").strip().lower() in {"1", "true", "yes", "on"}
+_ALLOW_RISKY_BUILD_TOOLS = os.environ.get("MCP_ALLOW_RISKY_BUILD_TOOLS", "0").strip().lower() in {"1", "true", "yes", "on"}
+if _ALLOW_RISKY_BUILD_TOOLS:
+    _ALLOWED_COMPILERS.update({"make", "cmake", "ninja"})
 
 _MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
 _MODEL_BRIDGE = GeminiBridge.from_env(
@@ -118,6 +136,11 @@ def _extract_cpp_inputs_from_command(
         else:
             resolved_path = os.path.normpath(resolved_path)
 
+        try:
+            resolved_path = _ensure_within_allowed_root(resolved_path)
+        except ValueError:
+            continue
+
         if os.path.splitext(resolved_path)[1].lower() not in cpp_exts:
             continue
         if resolved_path in seen_paths:
@@ -155,46 +178,65 @@ def _make_result(status: str, **kwargs) -> str:
     return json.dumps(payload, indent=2, default=str)
 
 
+def _result_to_dict(result: str) -> dict:
+    """Safely parse a JSON result string into a dict for tracing payloads."""
+    try:
+        parsed = json.loads(result)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return {"status": "error", "message": "unparseable result payload"}
+
+
 # ===================================================================
 # Sandbox helpers
 # ===================================================================
 
 def _contains_parent_traversal(path: str) -> bool:
     """Return True if the path tries to go up a directory using '..'."""
-    normalized = os.path.normpath(path)
-    parts = normalized.split(os.sep)
+    normalized = path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
     return ".." in parts
 
 
 def _ensure_within_allowed_root(path: str) -> str:
     """Normalise *path*, resolve symlinks, and verify it stays inside ALLOWED_ROOT.
 
-    Symlinks are resolved with ``os.path.realpath`` so that a symlink
-    pointing outside the sandbox cannot bypass the check.
+    Symlinks are resolved before path comparison so symlink escapes cannot
+    bypass the sandbox boundary.
     """
-    if _contains_parent_traversal(path):
+    candidate = str(path or "").strip()
+    if not candidate:
+        raise ValueError("Sandbox violation: empty path is not allowed.")
+
+    if _contains_parent_traversal(candidate):
         raise ValueError(
-            f"Sandbox violation: path uses '..' to traverse upwards: {path}"
+            f"Sandbox violation: path uses '..' to traverse upwards: {candidate}"
         )
 
-    if os.path.isabs(path):
-        absolute_path = os.path.abspath(path)
+    root_path = Path(ALLOWED_ROOT).resolve(strict=False)
+
+    if os.path.isabs(candidate):
+        absolute_path = Path(candidate)
     else:
-        absolute_path = os.path.abspath(os.path.join(ALLOWED_ROOT, path))
+        absolute_path = root_path / candidate
 
-    # Resolve symlinks *after* computing the absolute path.
-    resolved_path = os.path.realpath(absolute_path)
-    resolved_root = os.path.realpath(ALLOWED_ROOT)
+    resolved_path = absolute_path.resolve(strict=False)
+    resolved_root = root_path
 
-    common_root = os.path.commonpath([resolved_root, resolved_path])
-    if common_root != resolved_root:
+    resolved_path_norm = os.path.normcase(str(resolved_path))
+    resolved_root_norm = os.path.normcase(str(resolved_root))
+
+    common_root = os.path.commonpath([resolved_root_norm, resolved_path_norm])
+    if common_root != resolved_root_norm:
         raise ValueError(
             "Sandbox violation: path resolves outside the allowed project root.\n"
-            f"Requested path: {resolved_path}\n"
-            f"Allowed root:   {resolved_root}"
+            f"Requested path: {resolved_path_norm}\n"
+            f"Allowed root:   {resolved_root_norm}"
         )
 
-    return resolved_path
+    return str(resolved_path)
 
 
 def _validate_compiler_binary(command_parts: list[str]) -> str | None:
@@ -211,6 +253,114 @@ def _validate_compiler_binary(command_parts: list[str]) -> str | None:
             f"{sorted(_ALLOWED_COMPILERS)}"
         )
     return None
+
+
+def _resolve_path_token(token: str, cwd: Optional[str]) -> str:
+    if os.path.isabs(token):
+        return _ensure_within_allowed_root(token)
+    base = cwd or ALLOWED_ROOT
+    return _ensure_within_allowed_root(os.path.join(base, token))
+
+
+def _validate_compiler_arguments(command_parts: list[str], cwd: Optional[str]) -> str | None:
+    """Validate compiler flags and path-bearing arguments for sandbox safety."""
+    disallowed_prefixes = (
+        "-fplugin", "-specs=", "-B", "-wrapper", "@",
+        "-Xclang", "-load",
+    )
+    path_valued_flags = {
+        "-o", "-MF", "-MT", "-MQ", "-I", "-isystem", "-imacros", "-include", "-c", "-S", "-E",
+    }
+
+    index = 1
+    while index < len(command_parts):
+        token = command_parts[index]
+
+        if token.startswith(disallowed_prefixes):
+            return f"Disallowed compiler argument: {token}"
+
+        if token == "--":
+            break
+
+        if token in path_valued_flags:
+            if index + 1 >= len(command_parts):
+                return f"Flag {token} requires a following argument."
+            next_token = command_parts[index + 1]
+            if next_token.startswith("-") and token not in {"-c", "-S", "-E"}:
+                return f"Flag {token} has an invalid value: {next_token}"
+            if token in {"-o", "-MF", "-MT", "-MQ", "-I", "-isystem", "-imacros", "-include"}:
+                try:
+                    _resolve_path_token(next_token, cwd)
+                except ValueError as exc:
+                    return str(exc)
+            if token == "-o" and os.path.isabs(next_token):
+                try:
+                    _resolve_path_token(next_token, cwd)
+                except ValueError as exc:
+                    return str(exc)
+            index += 2
+            continue
+
+        if token.startswith("-o") and token != "-o":
+            output_path = token[2:]
+            if output_path:
+                try:
+                    _resolve_path_token(output_path, cwd)
+                except ValueError as exc:
+                    return str(exc)
+            index += 1
+            continue
+
+        # Non-flag tokens are typically source/object files; they must stay in sandbox.
+        if not token.startswith("-"):
+            try:
+                _resolve_path_token(token, cwd)
+            except ValueError as exc:
+                return str(exc)
+
+        index += 1
+
+    return None
+
+
+def _run_compiler_safe(command_parts: list[str], cwd: Optional[str]) -> dict[str, object]:
+    """Execute compiler subprocess with shared timeout/error handling."""
+    try:
+        completed_process = subprocess.run(
+            command_parts,
+            cwd=cwd or None,
+            capture_output=True,
+            text=True,
+            timeout=_RUN_COMPILER_TIMEOUT_SECONDS,
+        )
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "message": "The compiler program could not be found. Confirm the command name is installed and on your PATH.",
+            "kind": "missing-compiler",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "message": (
+                f"Compiler execution exceeded timeout of {_RUN_COMPILER_TIMEOUT_SECONDS} seconds "
+                "and was terminated."
+            ),
+            "kind": "timeout",
+        }
+    except Exception as error:
+        return {
+            "ok": False,
+            "message": f"Unexpected problem while running the compiler: {error!r}",
+            "kind": "runtime",
+        }
+
+    return {
+        "ok": True,
+        "returncode": int(completed_process.returncode),
+        "stdout": str(completed_process.stdout or ""),
+        "stderr": str(completed_process.stderr or ""),
+    }
 
 
 def _path_has_ignored_component(filepath: str) -> bool:
@@ -280,7 +430,7 @@ def write_code(file_path: str, content: str) -> str:
     Parent directories are created automatically when they do not exist.
 
     Truncation guard: if the target file already exists and the incoming content
-    is less than 50 % of the existing file’s length, the write is refused with
+    is less than 50 % of the existing file's length, the write is refused with
     an error so that partial/truncated LLM responses cannot silently corrupt
     source files.
     """
@@ -310,7 +460,7 @@ def write_code(file_path: str, content: str) -> str:
                     truncation_percent=pct,
                 )
         except UnicodeDecodeError:
-            pass  # Binary file — skip length check.
+            pass  # Binary file -- skip length check.
 
     directory = os.path.dirname(absolute_path)
     if directory:
@@ -376,146 +526,129 @@ def _build_location_hints(standard_output: str, error_output: str) -> list[dict]
 def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
     """Run a local compiler command and return its result as JSON.
 
-    Only whitelisted compiler binaries (g++, clang++, make, cmake, …) are
-    permitted.  Returns ``{status, exit_code, stdout, stderr, location_hints}``.
+    Only whitelisted compiler binaries are permitted and path-bearing arguments
+    are restricted to ALLOWED_ROOT.
     """
     _tool_log(
         "run_compiler",
         f"command='{command}', working_directory='{working_directory or '.'}'",
     )
 
+    raw_cpp_code = ""
+    if command:
+        try:
+            tokens_for_preview = shlex.split(command)
+            extracted = _extract_cpp_inputs_from_command(tokens_for_preview, working_directory)
+            if extracted:
+                raw_cpp_code = "\n\n".join(item.get("code", "") for item in extracted)
+        except Exception:
+            raw_cpp_code = ""
+
     span = _MODEL_BRIDGE.start_span(
         "run_compiler",
         input_payload={
             "command": command,
             "working_directory": working_directory or ".",
+            "cpp_code": raw_cpp_code,
         },
     )
 
     try:
         command_parts = shlex.split(command)
     except ValueError as error:
-        result = _make_result("error", message=f"Could not parse the command string: {error!r}")
-        parsed = json.loads(result)
-        _MODEL_BRIDGE.mark_trace_error("run_compiler parse error", details=parsed)
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-        return result
+        result_obj = {"status": "error", "message": f"Could not parse the command string: {error!r}"}
+        _MODEL_BRIDGE.mark_trace_error("run_compiler parse error", details=result_obj)
+        _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
+        return _make_result(**result_obj)
 
-    # --- Compiler whitelist enforcement ---
     rejection = _validate_compiler_binary(command_parts)
     if rejection is not None:
-        result = _make_result("error", message=rejection)
-        parsed = json.loads(result)
-        _MODEL_BRIDGE.mark_trace_error("run_compiler validation error", details=parsed)
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-        return result
+        result_obj = {"status": "error", "message": rejection}
+        _MODEL_BRIDGE.mark_trace_error("run_compiler validation error", details=result_obj)
+        _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
+        return _make_result(**result_obj)
 
     if working_directory is not None:
         try:
             working_directory_resolved = _ensure_within_allowed_root(working_directory)
         except ValueError as sandbox_error:
-            result = _make_result("error", message=str(sandbox_error))
-            parsed = json.loads(result)
-            _MODEL_BRIDGE.mark_trace_error("run_compiler sandbox error", details=parsed)
-            _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-            return result
+            result_obj = {"status": "error", "message": str(sandbox_error)}
+            _MODEL_BRIDGE.mark_trace_error("run_compiler sandbox error", details=result_obj)
+            _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
+            return _make_result(**result_obj)
 
         if not os.path.isdir(working_directory_resolved):
-            result = _make_result(
-                "error",
-                message=f"The working directory does not exist or is not a directory: {working_directory_resolved}",
-            )
-            parsed = json.loads(result)
-            _MODEL_BRIDGE.mark_trace_error("run_compiler invalid working directory", details=parsed)
-            _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-            return result
+            result_obj = {
+                "status": "error",
+                "message": f"The working directory does not exist or is not a directory: {working_directory_resolved}",
+            }
+            _MODEL_BRIDGE.mark_trace_error("run_compiler invalid working directory", details=result_obj)
+            _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
+            return _make_result(**result_obj)
     else:
         working_directory_resolved = None
 
+    arg_rejection = _validate_compiler_arguments(command_parts, working_directory_resolved)
+    if arg_rejection is not None:
+        result_obj = {"status": "error", "message": arg_rejection}
+        _MODEL_BRIDGE.mark_trace_error("run_compiler argument validation error", details=result_obj)
+        _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
+        return _make_result(**result_obj)
+
     cpp_inputs = _extract_cpp_inputs_from_command(command_parts, working_directory_resolved)
-    _MODEL_BRIDGE.end_span(
-        span,
-        output_payload={
-            "stage": "compiler-input",
-            "cpp_sources": cpp_inputs,
-        },
-    )
-    span = _MODEL_BRIDGE.start_span(
-        "run_compiler.execution",
-        input_payload={
-            "command": command,
-            "working_directory": working_directory_resolved or ".",
-            "cpp_sources": cpp_inputs,
-        },
-    )
+    execute_result = _run_compiler_safe(command_parts, working_directory_resolved)
 
-    try:
-        completed_process = subprocess.run(
-            command_parts,
-            cwd=working_directory_resolved or None,
-            capture_output=True,
-            text=True,
-            timeout=_RUN_COMPILER_TIMEOUT_SECONDS,
-        )
-    except FileNotFoundError:
-        result = _make_result(
-            "error",
-            message="The compiler program could not be found. "
-                    "Confirm the command name is installed and on your PATH.",
-        )
-        parsed = json.loads(result)
-        _MODEL_BRIDGE.mark_trace_error("run_compiler executable missing", details=parsed)
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-        return result
-    except subprocess.TimeoutExpired:
-        result = _make_result(
-            "error",
-            message=(
-                f"Compiler execution exceeded timeout of {_RUN_COMPILER_TIMEOUT_SECONDS} seconds "
-                "and was terminated."
-            ),
-        )
-        parsed = json.loads(result)
-        _MODEL_BRIDGE.mark_trace_error("run_compiler timeout", details=parsed)
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-        return result
-    except Exception as error:
-        result = _make_result("error", message=f"Unexpected problem while running the compiler: {error!r}")
-        parsed = json.loads(result)
-        _MODEL_BRIDGE.mark_trace_error("run_compiler execution failed", details=parsed)
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
-        return result
+    if not bool(execute_result.get("ok")):
+        result_obj = {
+            "status": "error",
+            "message": str(execute_result.get("message") or "Compiler execution failed."),
+            "kind": str(execute_result.get("kind") or "runtime"),
+        }
+        _MODEL_BRIDGE.mark_trace_error("run_compiler execution failed", details=result_obj)
+        _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
+        return _make_result(**result_obj)
 
-    exit_code = completed_process.returncode
-    stdout = (completed_process.stdout or "").strip()
-    stderr = (completed_process.stderr or "").strip()
+    exit_code = int(execute_result.get("returncode") or 0)
+    stdout = str(execute_result.get("stdout") or "").strip()
+    stderr = str(execute_result.get("stderr") or "").strip()
     hints = _build_location_hints(stdout, stderr)
 
-    result = _make_result(
-        "success" if exit_code == 0 else "error",
-        exit_code=exit_code,
-        stdout=stdout,
-        stderr=stderr,
-        location_hints=hints,
-    )
-    parsed = json.loads(result)
+    result_obj = {
+        "status": "success" if exit_code == 0 else "error",
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "location_hints": hints,
+        "working_directory": working_directory_resolved or ".",
+        "cpp_sources": cpp_inputs,
+    }
 
-    if parsed.get("status") == "error":
-        _MODEL_BRIDGE.mark_trace_error("run_compiler returned error", details=parsed)
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed, level="ERROR")
+    if result_obj["status"] == "error":
+        _MODEL_BRIDGE.mark_trace_error("run_compiler returned error", details=result_obj)
+        _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
     else:
-        _MODEL_BRIDGE.end_span(span, output_payload=parsed)
-    return result
+        _MODEL_BRIDGE.end_span(span, output_payload=result_obj)
+
+    return _make_result(**result_obj)
 
 
 @mcp_server.tool()
 def run_binary(path: str, timeout: int = 5) -> str:
     """Execute a compiled binary inside the sandbox and capture its output.
 
-    The binary must reside under ALLOWED_ROOT.  A timeout (seconds) prevents
+    The binary must reside under ALLOWED_ROOT. A timeout (seconds) prevents
     infinite loops from hanging the server.
     """
     _tool_log("run_binary", f"path='{path}', timeout={timeout}")
+
+    if not _ALLOW_RUN_BINARY:
+        return _make_result(
+            "error",
+            message=(
+                "run_binary is disabled by policy. Set MCP_ALLOW_RUN_BINARY=1 "
+                "to explicitly enable this tool."
+            ),
+        )
 
     try:
         absolute_path = _ensure_within_allowed_root(path)
@@ -616,7 +749,7 @@ def list_tree(path: str, depth: int = 2) -> str:
     """Render a visual directory tree from a path inside the sandbox.
 
     Directories in ``_IGNORED_DIRS`` (node_modules, .git, build,
-    vcpkg_installed, …) are skipped automatically to avoid noise.
+    vcpkg_installed, ...) are skipped automatically to avoid noise.
     """
     _tool_log("list_tree", f"path='{path}', depth={depth}")
 
@@ -807,29 +940,49 @@ _PRIMITIVE_TYPES: set[str] = {
 
 
 def _extract_template_arguments(text: str) -> list[str]:
-    """Extract the top-level comma-separated fragments from inside ``<…>``.
+    """Extract the top-level comma-separated fragments from inside ``<...>``.
 
-    Handles nesting so ``std::map<std::string, MyRecord>`` yields
-    ``["std::string", "MyRecord"]`` rather than splitting mid-token.
+    Handles nesting and supports C++17-style ``>>`` closing tokens.
     """
     args: list[str] = []
     depth = 0
     current: list[str] = []
+    index = 0
 
-    for ch in text:
+    while index < len(text):
+        ch = text[index]
+
         if ch == '<':
             depth += 1
             if depth == 1:
                 current = []
+                index += 1
                 continue
         elif ch == '>':
-            depth -= 1
-            if depth == 0 and current:
-                args.append(''.join(current).strip())
-                current = []
+            # Support nested close token '>>' in modern C++ template syntax.
+            if index + 1 < len(text) and text[index + 1] == '>' and depth > 1:
+                depth -= 2
+                if depth <= 0:
+                    fragment = ''.join(current).strip()
+                    if fragment:
+                        args.append(fragment)
+                    current = []
+                index += 2
                 continue
+
+            depth -= 1
+            if depth == 0:
+                fragment = ''.join(current).strip()
+                if fragment:
+                    args.append(fragment)
+                current = []
+                index += 1
+                continue
+
         if depth >= 1:
             current.append(ch)
+
+        index += 1
 
     return args
 
@@ -884,6 +1037,15 @@ def _extract_candidate_type_names(text: str) -> list[str]:
     return result
 
 
+def _strip_cpp_comments_and_strings(source_code: str) -> str:
+    """Remove comments and string literals to reduce regex false positives."""
+    without_block_comments = re.sub(r"/\*.*?\*/", "", source_code, flags=re.DOTALL)
+    without_line_comments = re.sub(r"//[^\n]*", "", without_block_comments)
+    without_strings = re.sub(r'"(?:\\.|[^"\\])*"', '""', without_line_comments)
+    without_char_literals = re.sub(r"'(?:\\.|[^'\\])*'", "''", without_strings)
+    return without_char_literals
+
+
 def _classify_ownership(source_code: str) -> list[str]:
     """Infer ownership / lifecycle notes from a type's source code.
 
@@ -891,19 +1053,20 @@ def _classify_ownership(source_code: str) -> list[str]:
     C++20 non-owning views, concepts, and coroutine types.
     """
     hints: list[str] = []
+    code = _strip_cpp_comments_and_strings(source_code)
 
     # --- Rule of Five analysis ---
-    has_dtor = bool(re.search(r'~\w+\s*\(', source_code))
-    has_copy_ctor = bool(re.search(r'\w+\s*\(\s*const\s+\w+\s*&\s*[),]', source_code))
-    has_copy_assign = bool(re.search(r'operator\s*=\s*\(\s*const\s+\w+\s*&', source_code))
-    has_move_ctor = bool(re.search(r'\w+\s*\(\s*\w+\s*&&\s*[),]', source_code))
-    has_move_assign = bool(re.search(r'operator\s*=\s*\(\s*\w+\s*&&', source_code))
-    has_deleted = bool(re.search(r'=\s*delete', source_code))
+    has_dtor = bool(re.search(r'~\w+\s*\(', code))
+    has_copy_ctor = bool(re.search(r'\w+\s*\(\s*const\s+\w+\s*&\s*[),]', code))
+    has_copy_assign = bool(re.search(r'operator\s*=\s*\(\s*const\s+\w+\s*&', code))
+    has_move_ctor = bool(re.search(r'\w+\s*\(\s*\w+\s*&&\s*[),]', code))
+    has_move_assign = bool(re.search(r'operator\s*=\s*\(\s*\w+\s*&&', code))
+    has_deleted = bool(re.search(r'=\s*delete', code))
 
     r5_count = sum([has_dtor, has_copy_ctor, has_copy_assign, has_move_ctor, has_move_assign])
 
     if has_deleted:
-        if re.search(r'\b(operator\s*=|\w+\s*\(\s*const\s+\w+\s*&)', source_code):
+        if re.search(r'\b(operator\s*=|\w+\s*\(\s*const\s+\w+\s*&)', code):
             hints.append("non-copyable (copy constructor or assignment deleted)")
         else:
             hints.append("has explicitly deleted special member(s)")
@@ -917,19 +1080,19 @@ def _classify_ownership(source_code: str) -> list[str]:
         hints.append("supports move semantics")
 
     # Swap idiom.
-    if re.search(r'\bswap\s*\(', source_code):
+    if re.search(r'\bswap\s*\(', code):
         hints.append("implements swap idiom")
 
     # Exclusive ownership.
-    if re.search(r'\bstd::unique_ptr\b', source_code):
-        hints.append("owns exclusive resource via std::unique_ptr — not copyable by default")
+    if re.search(r'\bstd::unique_ptr\b', code):
+        hints.append("owns exclusive resource via std::unique_ptr -- not copyable by default")
 
     # Shared ownership.
-    if re.search(r'\bstd::shared_ptr\b', source_code):
+    if re.search(r'\bstd::shared_ptr\b', code):
         hints.append("shares ownership via std::shared_ptr")
 
     # Polymorphic base.
-    if re.search(r'\bvirtual\b', source_code):
+    if re.search(r'\bvirtual\b', code):
         hints.append("polymorphic (has virtual method(s)); prefer pointer/reference semantics")
 
     # Explicit destructor without move (resource managed manually).
@@ -937,19 +1100,19 @@ def _classify_ownership(source_code: str) -> list[str]:
         hints.append("manages resources (explicit destructor, no move support)")
 
     # C++20: Non-owning views.
-    if re.search(r'\bstd::span\b', source_code):
+    if re.search(r'\bstd::span\b', code):
         hints.append("uses std::span (non-owning contiguous view)")
-    if re.search(r'\bstd::string_view\b', source_code):
+    if re.search(r'\bstd::string_view\b', code):
         hints.append("uses std::string_view (non-owning string reference)")
 
     # C++20: Concepts and constraints.
-    if re.search(r'\brequires\b', source_code):
+    if re.search(r'\brequires\b', code):
         hints.append("C++20 constrained (uses requires clause)")
-    if re.search(r'\bconcept\b', source_code):
+    if re.search(r'\bconcept\b', code):
         hints.append("defines or uses C++20 concept")
 
     # C++20: Coroutines.
-    if re.search(r'\bco_await\b|\bco_yield\b|\bco_return\b', source_code):
+    if re.search(r'\bco_await\b|\bco_yield\b|\bco_return\b', code):
         hints.append("C++20 coroutine type (uses co_await/co_yield/co_return)")
 
     return hints if hints else ["standard value semantics (copyable and movable)"]
@@ -999,6 +1162,37 @@ def _collect_type_bundle(
     return bundle
 
 
+def _summarize_type_definition(source_code: str) -> str:
+    """Return a compact type-definition summary for prompt-size control."""
+    if _TYPE_BUNDLE_INCLUDE_FULL_SOURCE:
+        return source_code
+
+    compact = _strip_cpp_comments_and_strings(source_code)
+    compact = re.sub(r"\n{3,}", "\n\n", compact).strip()
+
+    brace_index = compact.find("{")
+    if brace_index == -1:
+        truncated, was_truncated = _truncate_text(compact, _TYPE_BUNDLE_MAX_DEF_CHARS)
+        if was_truncated:
+            truncated += "\n// <type definition truncated>"
+        return truncated
+
+    header_part = compact[: brace_index + 1]
+    body_part = compact[brace_index + 1:]
+    body_lines = [ln.strip() for ln in body_part.splitlines() if ln.strip()]
+    member_lines = [ln for ln in body_lines if ln.endswith(";")][:12]
+
+    summary = header_part + "\n"
+    if member_lines:
+        summary += "\n".join(member_lines)
+    summary += "\n};"
+
+    truncated, was_truncated = _truncate_text(summary, _TYPE_BUNDLE_MAX_DEF_CHARS)
+    if was_truncated:
+        truncated += "\n// <type summary truncated>"
+    return truncated
+
+
 def _format_type_bundle(
     bundle: dict[str, dict],
     header_paths: dict[str, str] | None = None,
@@ -1026,7 +1220,7 @@ def _format_type_bundle(
         hints = info.get("ownership_hints") or []
         lines.append(f"Ownership/Lifecycle: {'; '.join(hints)}")
         lines.append("Definition:")
-        lines.append(str(info.get("source_code", "")))
+        lines.append(_summarize_type_definition(str(info.get("source_code", ""))))
 
     return "\n".join(lines)
 
@@ -1039,13 +1233,13 @@ class _GlobalProjectMapCache:
     """Lazily scans all C++ source / header files under ALLOWED_ROOT.
 
     Features:
-    - **Incremental indexing** — tracks ``mtime`` per file and only re-parses
+    - **Incremental indexing** -- tracks ``mtime`` per file and only re-parses
       files that changed since the last scan.
-    - **Background build** — ``build_in_background()`` spawns a daemon thread
+    - **Background build** -- ``build_in_background()`` spawns a daemon thread
       so the first tool call need not block for large codebases.
-    - **Header-path tracking** — records which file each type was defined in
+    - **Header-path tracking** -- records which file each type was defined in
       so ``get_context_for_function`` can report it in the Type Bundle.
-    - **``_IGNORED_DIRS`` filtering** — skips node_modules, build, etc.
+    - **``_IGNORED_DIRS`` filtering** -- skips node_modules, build, etc.
     """
 
     _instance: "_GlobalProjectMapCache | None" = None
@@ -1059,6 +1253,8 @@ class _GlobalProjectMapCache:
         self._include_graph: dict[str, list[str]] = {}
         self._built: bool = False
         self._building: bool = False
+        self._data_lock = threading.RLock()
+        self._build_event = threading.Event()
 
     @classmethod
     def get(cls) -> "_GlobalProjectMapCache":
@@ -1082,40 +1278,68 @@ class _GlobalProjectMapCache:
         except Exception:
             return
 
-        try:
-            self._file_mtimes[filepath] = os.path.getmtime(filepath)
-        except OSError:
-            pass
+        with self._data_lock:
+            try:
+                self._file_mtimes[filepath] = os.path.getmtime(filepath)
+            except OSError:
+                pass
 
-        # Evict stale entries belonging to this file.
-        stale_names = [n for n, f in self._type_to_file.items() if f == filepath]
-        for n in stale_names:
-            self._type_definitions.pop(n, None)
-            self._type_to_file.pop(n, None)
-        self._types_meta = [
-            t for t in self._types_meta
-            if self._type_to_file.get(str(t.get("name", ""))) != filepath
-        ]
+            # Evict stale entries belonging to this file.
+            stale_names = [n for n, f in self._type_to_file.items() if f == filepath]
+            for n in stale_names:
+                self._type_definitions.pop(n, None)
+                self._type_to_file.pop(n, None)
+            self._types_meta = [
+                t for t in self._types_meta
+                if self._type_to_file.get(str(t.get("name", ""))) != filepath
+            ]
 
-        # Insert fresh data.
-        for name, src in (pm.get("type_definitions") or {}).items():
-            self._type_definitions[name] = src
-            self._type_to_file[name] = filepath
-        self._types_meta.extend(pm.get("types") or [])
+            # Insert fresh data.
+            for name, src in (pm.get("type_definitions") or {}).items():
+                self._type_definitions[name] = src
+                self._type_to_file[name] = filepath
+            self._types_meta.extend(pm.get("types") or [])
 
-        # Track the include graph for this file.
-        headers: list[str] = pm.get("headers") or []
-        self._include_graph[filepath] = headers
+            # Track the include graph for this file.
+            headers: list[str] = pm.get("headers") or []
+            self._include_graph[filepath] = headers
+
+            self._enforce_cache_bounds()
+
+    def _enforce_cache_bounds(self) -> None:
+        """Bound memory growth by capping retained type-definition entries."""
+        current_size = len(self._type_definitions)
+        if current_size <= _GLOBAL_CACHE_MAX_TYPES:
+            return
+
+        # Keep most recently seen files based on mtime and evict oldest first.
+        by_age = sorted(self._file_mtimes.items(), key=lambda item: item[1])
+        while len(self._type_definitions) > _GLOBAL_CACHE_MAX_TYPES and by_age:
+            stale_file, _mtime = by_age.pop(0)
+            stale_names = [n for n, f in self._type_to_file.items() if f == stale_file]
+            for name in stale_names:
+                self._type_definitions.pop(name, None)
+                self._type_to_file.pop(name, None)
+            self._types_meta = [
+                t for t in self._types_meta
+                if self._type_to_file.get(str(t.get("name", ""))) != stale_file
+            ]
+            self._include_graph.pop(stale_file, None)
+            self._file_mtimes.pop(stale_file, None)
 
     # --- Build methods ------------------------------------------------------
 
     def _build(self) -> None:
-        if self._building:
-            return
-        self._building = True
+        with self._data_lock:
+            if self._building:
+                return
+            self._building = True
+            self._build_event.clear()
+
         try:
             if not _PARSER_AVAILABLE:
-                self._built = True
+                with self._data_lock:
+                    self._built = True
                 return
 
             parser = CppParser()
@@ -1125,21 +1349,53 @@ class _GlobalProjectMapCache:
                 for filepath in glob.glob(pattern, recursive=True):
                     if _path_has_ignored_component(filepath):
                         continue
-                    if not self._built or self._should_reindex_file(filepath):
+                    should_index = False
+                    with self._data_lock:
+                        should_index = (not self._built) or self._should_reindex_file(filepath)
+                    if should_index:
                         self._index_file(parser, filepath)
-            self._built = True
+
+            # Remove files that no longer exist.
+            with self._data_lock:
+                missing_files = [p for p in self._file_mtimes if not os.path.exists(p)]
+                for stale_file in missing_files:
+                    stale_names = [n for n, f in self._type_to_file.items() if f == stale_file]
+                    for name in stale_names:
+                        self._type_definitions.pop(name, None)
+                        self._type_to_file.pop(name, None)
+                    self._types_meta = [
+                        t for t in self._types_meta
+                        if self._type_to_file.get(str(t.get("name", ""))) != stale_file
+                    ]
+                    self._include_graph.pop(stale_file, None)
+                    self._file_mtimes.pop(stale_file, None)
+                self._built = True
         finally:
-            self._building = False
+            with self._data_lock:
+                self._building = False
+                self._build_event.set()
 
     def build_in_background(self) -> threading.Thread:
         """Launch a daemon thread that builds the cache without blocking."""
+        with self._data_lock:
+            if self._building:
+                thread = threading.Thread(target=lambda: None, daemon=True)
+                thread.start()
+                return thread
         thread = threading.Thread(target=self._build, daemon=True)
         thread.start()
         return thread
 
     def ensure_built(self) -> None:
-        if not self._built:
-            self._build()
+        with self._data_lock:
+            already_built = self._built
+            is_building = self._building
+        if already_built:
+            return
+        if is_building:
+            self._build_event.wait(timeout=10)
+            return
+        self._build()
 
     # --- Query methods ------------------------------------------------------
 
@@ -1148,22 +1404,24 @@ class _GlobalProjectMapCache:
     ) -> tuple[dict[str, str], list[dict]]:
         """Return (type_definitions, types_meta) for the requested names."""
         self.ensure_built()
-        matched_defs = {
-            n: self._type_definitions[n]
-            for n in type_names
-            if n in self._type_definitions
-        }
-        name_set = set(type_names)
-        matched_meta = [
-            t for t in self._types_meta
-            if str(t.get("name", "")) in name_set
-        ]
+        with self._data_lock:
+            matched_defs = {
+                n: self._type_definitions[n]
+                for n in type_names
+                if n in self._type_definitions
+            }
+            name_set = set(type_names)
+            matched_meta = [
+                t for t in self._types_meta
+                if str(t.get("name", "")) in name_set
+            ]
         return matched_defs, matched_meta
 
     def get_header_path(self, type_name: str) -> str:
         """Return the workspace-relative path where *type_name* is defined."""
         self.ensure_built()
-        filepath = self._type_to_file.get(type_name, "")
+        with self._data_lock:
+            filepath = self._type_to_file.get(type_name, "")
         if filepath:
             return os.path.relpath(filepath, ALLOWED_ROOT)
         return ""
@@ -1171,7 +1429,8 @@ class _GlobalProjectMapCache:
     def get_include_graph_for_file(self, filepath: str) -> dict[str, str | None]:
         """Return ``{include_directive: resolved_path | None}`` for *filepath*."""
         self.ensure_built()
-        raw_headers = self._include_graph.get(filepath, [])
+        with self._data_lock:
+            raw_headers = list(self._include_graph.get(filepath, []))
         result: dict[str, str | None] = {}
         file_dir = os.path.dirname(filepath)
         for hdr in raw_headers:
@@ -1202,17 +1461,19 @@ class _GlobalProjectMapCache:
 
     def invalidate(self) -> None:
         """Force a full rescan on next access."""
-        with self._lock:
+        with self._data_lock:
             self._type_definitions.clear()
             self._types_meta.clear()
             self._file_mtimes.clear()
             self._type_to_file.clear()
             self._include_graph.clear()
             self._built = False
+            self._building = False
+            self._build_event.clear()
 
 
 # ===================================================================
-# MCP tools — semantic / contextual
+# MCP tools -- semantic / contextual
 # ===================================================================
 
 @mcp_server.tool()
@@ -1220,11 +1481,11 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
     """Return a rich modernisation context bundle for a single C++ function.
 
     The JSON result contains:
-    1. **function_context** — signature, body, parameters.
-    2. **called_signatures** — signatures of internally called functions.
-    3. **type_bundle** — definitions + ownership hints + *header_path* for
+    1. **function_context** -- signature, body, parameters.
+    2. **called_signatures** -- signatures of internally called functions.
+    3. **type_bundle** -- definitions + ownership hints + *header_path* for
        every custom type used in the function (resolved cross-file).
-    4. **required_headers** — inferred ``#include`` directives.
+    4. **required_headers** -- inferred ``#include`` directives.
     """
     _tool_log(
         "get_context_for_function",
@@ -1236,7 +1497,7 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         input_payload={
             "file_path": file_path,
             "function_fqn": function_fqn,
-            "cpp_code": _read_text_if_exists(file_path),
+            "cpp_code": "",
         },
     )
 
@@ -1245,55 +1506,88 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
             "error",
             message="CppParser is unavailable. Ensure 'tree-sitter-cpp' is installed.",
         )
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
     if not function_fqn or not function_fqn.strip():
         result = _make_result("error", message="function_fqn must be a non-empty fully-qualified function name.")
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
         result = _make_result("error", message=str(sandbox_error))
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
     if not os.path.isfile(absolute_path):
         result = _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
     source_text = _read_text_if_exists(absolute_path)
+    if span is not None:
+        _MODEL_BRIDGE.end_span(
+            span,
+            output_payload={
+                "stage": "resolved-input",
+                "file_path": os.path.relpath(absolute_path, ALLOWED_ROOT),
+                "function_fqn": function_fqn,
+                "cpp_code": source_text,
+            },
+        )
+        span = _MODEL_BRIDGE.start_span(
+            "get_context_for_function.execution",
+            input_payload={
+                "file_path": os.path.relpath(absolute_path, ALLOWED_ROOT),
+                "function_fqn": function_fqn,
+                "cpp_code": source_text,
+            },
+        )
 
     try:
         parser = CppParser()
         project_map = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
     except Exception as exc:
         result = _make_result("error", message=f"Failed to parse C++ file: {exc!r}")
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
     functions: dict = project_map.get("functions") or {}
-    if not isinstance(functions, dict) or function_fqn not in functions:
+    if not isinstance(functions, dict):
+        available: list[str] = []
+        result = _make_result(
+            "error",
+            message=f"Function '{function_fqn}' not found in {os.path.basename(absolute_path)}.",
+            available_fqns=available,
+        )
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
+        return result
+
+    try:
+        base_context = parser.get_context_for_function(function_fqn)
+    except Exception as exc:
+        available = sorted(functions.keys()) if isinstance(functions, dict) else []
+        result = _make_result(
+            "error",
+            message=f"Context extraction failed: {exc!r}",
+            available_fqns=available,
+        )
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
+        return result
+
+    resolved_fqn = str(base_context.get("fqn") or function_fqn)
+    fn_meta = functions.get(resolved_fqn)
+    if not isinstance(fn_meta, dict):
         available = sorted(functions.keys()) if isinstance(functions, dict) else []
         result = _make_result(
             "error",
             message=f"Function '{function_fqn}' not found in {os.path.basename(absolute_path)}.",
             available_fqns=available,
         )
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
-
-    try:
-        base_context = parser.get_context_for_function(function_fqn)
-    except Exception as exc:
-        result = _make_result("error", message=f"Context extraction failed: {exc!r}")
-        _MODEL_BRIDGE.end_span(span, output_payload=json.loads(result), level="ERROR")
-        return result
-
-    fn_meta = functions[function_fqn]
     signature = str(fn_meta.get("signature") or "")
     body = str(base_context.get("body") or "")
     called_signatures: dict = base_context.get("called_function_signatures") or {}
@@ -1356,23 +1650,18 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
 
     context_text = "\n".join(sections)
 
-    result = _make_result(
-        "success",
-        context=context_text,
-        function_fqn=function_fqn,
-        header_paths=header_paths,
-        required_headers=include_reqs,
-    )
+    result_obj = {
+        "status": "success",
+        "context": context_text,
+        "function_fqn": function_fqn,
+        "header_paths": header_paths,
+        "required_headers": include_reqs,
+    }
     _MODEL_BRIDGE.end_span(
         span,
-        output_payload={
-            "status": "success",
-            "function_fqn": function_fqn,
-            "cpp_code": source_text,
-            "context": json.loads(result),
-        },
+        output_payload=result_obj,
     )
-    return result
+    return _make_result(**result_obj)
 
 
 @mcp_server.tool()
@@ -1467,6 +1756,20 @@ def add_header_to_file(file_path: str, header_name: str) -> str:
                 already_present=True,
             )
 
+    resolution_warning = ""
+    try:
+        global_cache = _GlobalProjectMapCache.get()
+        resolved = global_cache._resolve_header(header_name, os.path.dirname(absolute_path))
+        if resolved is None:
+            resolution_warning = (
+                f"Header {header_name} could not be resolved inside the workspace. "
+                "Include was still added."
+            )
+    except Exception:
+        resolution_warning = (
+            f"Header {header_name} resolution check failed. Include was still added."
+        )
+
     last_include_idx = -1
     for idx, line in enumerate(lines):
         if line.lstrip().startswith("#include"):
@@ -1487,6 +1790,7 @@ def add_header_to_file(file_path: str, header_name: str) -> str:
         "success",
         message=f"Added '{include_directive}' to {os.path.basename(absolute_path)}.",
         already_present=False,
+        warning=resolution_warning,
     )
 
 
@@ -1494,11 +1798,7 @@ def add_header_to_file(file_path: str, header_name: str) -> str:
 def get_compilation_errors(
     command: str, working_directory: Optional[str] = None,
 ) -> str:
-    """Run a compiler command and return a JSON object with structured errors.
-
-    Each entry has the shape ``{file, line, error_message}``.
-    On success (exit code 0) the ``errors`` list is empty.
-    """
+    """Run a compiler command and return a JSON object with structured diagnostics."""
     _tool_log(
         "get_compilation_errors",
         f"command='{command}', working_directory='{working_directory or '.'}'",
@@ -1512,7 +1812,6 @@ def get_compilation_errors(
             errors=[{"file": "<command>", "line": 0, "error_message": f"Bad command string: {error}"}],
         )
 
-    # Compiler whitelist applies here too.
     rejection = _validate_compiler_binary(command_parts)
     if rejection is not None:
         return _make_result(
@@ -1535,52 +1834,75 @@ def get_compilation_errors(
                 errors=[{"file": "<cwd>", "line": 0, "error_message": f"Directory not found: {cwd_resolved}"}],
             )
 
-    try:
-        proc = subprocess.run(
-            command_parts,
-            cwd=cwd_resolved,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
+    arg_rejection = _validate_compiler_arguments(command_parts, cwd_resolved)
+    if arg_rejection is not None:
         return _make_result(
             "error",
-            errors=[{"file": "<compiler>", "line": 0, "error_message": "Compiler not found on PATH."}],
+            errors=[{"file": "<args>", "line": 0, "error_message": arg_rejection}],
         )
-    except Exception as exc:
+
+    run_result = _run_compiler_safe(command_parts, cwd_resolved)
+    if not bool(run_result.get("ok")):
         return _make_result(
             "error",
-            errors=[{"file": "<runtime>", "line": 0, "error_message": repr(exc)}],
+            errors=[{"file": "<runtime>", "line": 0, "error_message": str(run_result.get("message") or "Execution failed")}],
         )
 
-    if proc.returncode == 0:
-        return _make_result("success", errors=[], exit_code=0)
+    return_code = int(run_result.get("returncode") or 0)
+    stdout_text = str(run_result.get("stdout") or "")
+    stderr_text = str(run_result.get("stderr") or "")
 
-    # Parse gcc/clang style diagnostics.
-    error_pattern = re.compile(
-        r'^(?P<file>[^:\s]+):(?P<line>\d+):\d*:?\s*(?:error|fatal error):\s*(?P<msg>.+)$',
+    if return_code == 0:
+        return _make_result("success", errors=[], warnings=[], exit_code=0)
+
+    combined = stdout_text + "\n" + stderr_text
+
+    gcc_clang_error = re.compile(
+        r'^(?P<file>[^:\s]+):(?P<line>\d+)(?::(?P<column>\d+))?:\s*(?P<severity>fatal error|error|warning):\s*(?P<msg>.+)$',
+        re.MULTILINE,
+    )
+    msvc_diag = re.compile(
+        r'^(?P<file>[^\(\r\n]+)\((?P<line>\d+)(?:,(?P<column>\d+))?\):\s*(?P<severity>fatal error|error|warning)\s+[A-Z]+\d+:\s*(?P<msg>.+)$',
         re.MULTILINE,
     )
 
-    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
     errors: list[dict] = []
-    seen: set[tuple[str, int, str]] = set()
-    for m in error_pattern.finditer(combined):
-        entry = (m.group("file"), int(m.group("line")), m.group("msg").strip())
-        if entry not in seen:
-            seen.add(entry)
-            errors.append({"file": entry[0], "line": entry[1], "error_message": entry[2]})
+    warnings: list[dict] = []
+    seen_errors: set[tuple[str, int, str]] = set()
+    seen_warnings: set[tuple[str, int, str]] = set()
 
-    if not errors:
+    def _collect(match_obj: re.Match[str]) -> None:
+        file_name = (match_obj.group("file") or "<unknown>").strip()
+        line = int(match_obj.group("line") or 0)
+        message = (match_obj.group("msg") or "").strip()
+        severity = (match_obj.group("severity") or "error").lower()
+        payload = {"file": file_name, "line": line, "error_message": message}
+        key = (file_name, line, message)
+        if "warning" in severity:
+            if key not in seen_warnings:
+                seen_warnings.add(key)
+                warnings.append(payload)
+            return
+        if key not in seen_errors:
+            seen_errors.add(key)
+            errors.append(payload)
+
+    for matcher in (gcc_clang_error, msvc_diag):
+        for found in matcher.finditer(combined):
+            _collect(found)
+
+    if not errors and not warnings:
         errors.append({
             "file": "<unknown>",
             "line": 0,
-            "error_message": (proc.stderr or proc.stdout or "compilation failed with no output").strip()[:2000],
+            "error_message": (stderr_text or stdout_text or "compilation failed with no output").strip()[:2000],
         })
 
-    return _make_result("error", errors=errors, exit_code=proc.returncode)
+    return _make_result("error", errors=errors, warnings=warnings, exit_code=return_code)
 
 
 if __name__ == "__main__":
     _GlobalProjectMapCache.get().build_in_background()
     mcp_server.run()
+
+

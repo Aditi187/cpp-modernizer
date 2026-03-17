@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import hashlib
+import logging
+import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 from tree_sitter import Language, Parser
+
+logger = logging.getLogger(__name__)
 
 
 _CPP_KEYWORDS_TO_IGNORE = {
@@ -26,10 +32,16 @@ _CPP_KEYWORDS_TO_IGNORE = {
     "const_cast",
 }
 
-_MODIFIER_TOKENS = ("virtual", "static", "inline", "constexpr", "consteval")
+_MODIFIER_TOKENS = ("virtual", "static", "inline", "constexpr", "consteval", "noexcept", "override", "final")
 
 
 ProjectMap = Dict[str, Any]
+# Configurable via CPP_PARSER_MAX_AST_NODES env var; default 200 000 which handles
+# typical large files without Python recursion concerns.
+MAX_AST_NODES: int = max(1_000, int(os.environ.get("CPP_PARSER_MAX_AST_NODES", "200000")))
+
+# Thread-local storage for parser instances — tree-sitter parsers are NOT thread-safe.
+_thread_local: threading.local = threading.local()
 
 _STD_HEADER_SYMBOLS: Dict[str, Set[str]] = {
     "<vector>": {"std::vector", "vector"},
@@ -49,6 +61,11 @@ _STD_HEADER_SYMBOLS: Dict[str, Set[str]] = {
     "<thread>": {"std::thread", "thread"},
     "<mutex>": {"std::mutex", "std::lock_guard", "mutex", "lock_guard"},
     "<chrono>": {"std::chrono", "chrono"},
+    "<span>": {"std::span", "span"},
+    "<expected>": {"std::expected", "expected"},
+    "<format>": {"std::format", "format"},
+    "<print>": {"std::print", "print"},
+    "<ranges>": {"std::ranges", "ranges", "views"},
 }
 
 
@@ -63,6 +80,11 @@ _TEMPLATE_SYMBOL_BASES: Dict[str, Set[str]] = {
     "<variant>": {"variant"},
     "<tuple>": {"tuple"},
     "<memory>": {"unique_ptr", "shared_ptr", "weak_ptr"},
+    "<span>": {"span"},
+    "<expected>": {"expected", "unexpected"},
+    "<format>": {"format", "vformat"},
+    "<print>": {"print", "println"},
+    "<ranges>": {"ranges", "views"},
 }
 
 
@@ -73,12 +95,20 @@ class CppParser:
         self._parser = self._create_cpp_parser()
         self._last_project_map: Optional[ProjectMap] = None
         self._workspace_root: Optional[Path] = None
+        self._current_file_path: str = ""
 
     @staticmethod
     def _create_cpp_parser() -> Parser:
         """
         Create a parser configured for C++ with tree-sitter v0.21+ compatibility.
+
+        A per-thread instance is cached in thread-local storage because tree-sitter
+        Parser objects are NOT thread-safe; sharing one instance across threads can
+        corrupt internal parser state.
         """
+        existing: Parser | None = getattr(_thread_local, "cpp_parser", None)
+        if existing is not None:
+            return existing
 
         try:
             import tree_sitter_cpp
@@ -99,6 +129,7 @@ class CppParser:
         else:
             raise RuntimeError("Unsupported tree-sitter Parser API for setting language")
 
+        _thread_local.cpp_parser = parser
         return parser
 
     def parse_file(
@@ -118,20 +149,49 @@ class CppParser:
             raise FileNotFoundError(f"C++ file not found: {path}")
         if workspace_root is not None:
             self._workspace_root = Path(workspace_root)
-        return self.parse_string(path.read_text(encoding="utf-8"))
+        self._current_file_path = str(path)
+        return self.parse_string(path.read_text(encoding="utf-8"), source_file=str(path))
 
-    def parse_string(self, source_text: str) -> ProjectMap:
+    def parse_string(self, source_text: str, source_file: str = "") -> ProjectMap:
         """Parse C++ source text into a Janus-style ProjectMap."""
 
         source_bytes = source_text.encode("utf-8")
-        tree = self._parser.parse(source_bytes)
+        try:
+            tree = self._parser.parse(source_bytes)
+        except Exception:
+            project_map = {
+                "functions": {},
+                "type_definitions": {},
+                "dependency_order": [],
+                "include_requirements": {},
+                "headers": [],
+                "types": [],
+                "global_context": {},
+                "global_variables": [],
+            }
+            self._last_project_map = project_map
+            return project_map
+
         project_map = self._collect_semantic_map_single_pass(
             tree.root_node,
             source_text,
             source_bytes,
+            source_file=source_file or self._current_file_path,
         )
         self._last_project_map = project_map
         return project_map
+
+    def parse_bytes(self, source_bytes: bytes) -> Any:
+        """Parse C++ bytes and return the raw tree-sitter tree object."""
+        return self._parser.parse(source_bytes)
+
+    def iter_nodes(self, root: Any) -> Iterable[Any]:
+        """Public node traversal helper for consumers that need AST walking."""
+        return self._iter_nodes(root)
+
+    def node_text(self, node: Any, source_bytes: bytes) -> str:
+        """Public node text extraction helper."""
+        return self._node_text(node, source_bytes)
 
     def get_context_for_function(self, fqn: str) -> Dict[str, Any]:
         """
@@ -147,8 +207,24 @@ class CppParser:
             raise ValueError("No ProjectMap available. Run parse_file or parse_string first.")
 
         functions = self._last_project_map.get("functions", {})
-        if not isinstance(functions, dict) or fqn not in functions:
+        if not isinstance(functions, dict):
             raise KeyError(f"Function not found in ProjectMap: {fqn}")
+
+        if fqn not in functions:
+            # Backward-compatible fallback: allow lookup by legacy non-unique FQN.
+            legacy_matches = [
+                key
+                for key, meta in functions.items()
+                if str(meta.get("fqn") or "") == fqn
+            ]
+            if len(legacy_matches) == 1:
+                fqn = legacy_matches[0]
+            elif len(legacy_matches) > 1:
+                raise KeyError(
+                    f"Function FQN '{fqn}' is ambiguous across overloads; use unique_fqn."
+                )
+            else:
+                raise KeyError(f"Function not found in ProjectMap: {fqn}")
 
         function_meta = functions[fqn]
         body = str(function_meta.get("body") or "")
@@ -174,15 +250,64 @@ class CppParser:
             "referenced_type_definitions": referenced_type_definitions,
         }
 
+    @staticmethod
+    def _compute_signature_hash(parameters: List[Dict[str, Any]]) -> str:
+        """Return a short deterministic hash of function parameter types."""
+        type_str = ",".join(str(p.get("type") or "") for p in parameters)
+        return hashlib.md5(type_str.encode("utf-8")).hexdigest()[:8]
+
+    def _process_ast_node(
+        self,
+        node: Any,
+        scope_stack: List[str],
+        source_text: str,
+        source_bytes: bytes,
+        line_starts: List[int],
+        source_file: str,
+        functions: List[Dict[str, Any]],
+        headers: List[str],
+        types: List[Dict[str, Any]],
+        global_context: Dict[str, List[Dict[str, Any]]],
+    ) -> Optional[str]:
+        """Process a single AST node during the single-pass traversal.
+
+        Mutates *functions*, *headers*, *types*, and *global_context* in place.
+        Returns the scope name that should be pushed onto *scope_stack* (or None).
+        """
+        if node.type == "function_definition":
+            functions.append(
+                self._build_function_record(
+                    node=node,
+                    scope_stack=scope_stack,
+                    source_text=source_text,
+                    source_bytes=source_bytes,
+                    line_starts=line_starts,
+                    source_file=source_file,
+                )
+            )
+
+        if node.type == "preproc_include":
+            header = self._extract_include_directive(node, source_bytes)
+            if header and header not in headers:
+                headers.append(header)
+
+        type_record = self._build_type_record(node, scope_stack, source_bytes, line_starts)
+        if type_record is not None:
+            types.append(type_record)
+            context_bucket = type_record.get("type")
+            if isinstance(context_bucket, str) and context_bucket in global_context:
+                global_context[context_bucket].append(type_record)
+
+        return self._scope_name(node, source_bytes)
+
     def _collect_semantic_map_single_pass(
         self,
         root_node: Any,
         source_text: str,
         source_bytes: bytes,
+        source_file: str = "",
     ) -> ProjectMap:
-        """
-        Traverse AST once with TreeCursor while maintaining scope for FQNs.
-        """
+        """Traverse the AST once while maintaining a scope stack for FQN construction."""
 
         scope_stack: List[str] = []
         functions: List[Dict[str, Any]] = []
@@ -197,7 +322,6 @@ class CppParser:
         }
 
         line_starts = self._compute_line_start_bytes(source_text)
-
         stack: List[tuple[Any, int, bool]] = [(root_node, 0, False)]
 
         while stack:
@@ -208,40 +332,20 @@ class CppParser:
                     scope_stack.pop()
                 continue
 
-            if node.type == "function_definition":
-                functions.append(
-                    self._build_function_record(
-                        node=node,
-                        scope_stack=scope_stack,
-                        source_text=source_text,
-                        source_bytes=source_bytes,
-                        line_starts=line_starts,
-                    )
-                )
-
-            if node.type == "preproc_include":
-                header = self._extract_include_directive(node, source_bytes)
-                if header and header not in headers:
-                    headers.append(header)
-
-            type_record = self._build_type_record(node, scope_stack, source_bytes, line_starts)
-            if type_record is not None:
-                types.append(type_record)
-                context_bucket = type_record.get("type")
-                if isinstance(context_bucket, str) and context_bucket in global_context:
-                    global_context[context_bucket].append(type_record)
-
-            scope_name = self._scope_name(node, source_bytes)
-            pushed_now = False
-            if scope_name:
+            scope_name = self._process_ast_node(
+                node, scope_stack, source_text, source_bytes,
+                line_starts, source_file, functions, headers, types, global_context,
+            )
+            pushed_now = scope_name is not None
+            if pushed_now:
                 scope_stack.append(scope_name)
-                pushed_now = True
 
             stack.append((node, 1, pushed_now))
             for child in reversed(node.children):
                 stack.append((child, 0, False))
 
-        return self._build_project_map(functions, types, headers, global_context)
+        global_variables = self._collect_global_variables(root_node, source_bytes, line_starts)
+        return self._build_project_map(functions, types, headers, global_context, global_variables)
 
     def _build_project_map(
         self,
@@ -249,6 +353,7 @@ class CppParser:
         types: List[Dict[str, Any]],
         headers: List[str],
         global_context: Dict[str, List[Dict[str, Any]]],
+        global_variables: List[Dict[str, Any]],
     ) -> ProjectMap:
         function_map: Dict[str, Dict[str, Any]] = {}
         type_definitions: Dict[str, str] = {}
@@ -258,22 +363,29 @@ class CppParser:
             if type_name and type_name not in type_definitions:
                 type_definitions[type_name] = str(t.get("source_code") or "")
 
-        all_fqns = {str(f.get("fqn") or "") for f in functions if f.get("fqn")}
-        all_names = {str(f.get("name") or "") for f in functions if f.get("name")}
-        name_to_fqn: Dict[str, str] = {}
+        all_function_ids = {
+            str(f.get("unique_fqn") or f.get("fqn") or "")
+            for f in functions
+            if f.get("unique_fqn") or f.get("fqn")
+        }
+        name_to_function_ids: Dict[str, List[str]] = {}
+        legacy_fqn_to_ids: Dict[str, List[str]] = {}
         for f in functions:
             name = str(f.get("name") or "")
-            fqn = str(f.get("fqn") or "")
-            if name and fqn and name not in name_to_fqn:
-                name_to_fqn[name] = fqn
+            function_id = str(f.get("unique_fqn") or f.get("fqn") or "")
+            legacy_fqn = str(f.get("fqn") or "")
+            if name and function_id:
+                name_to_function_ids.setdefault(name, []).append(function_id)
+            if legacy_fqn and function_id:
+                legacy_fqn_to_ids.setdefault(legacy_fqn, []).append(function_id)
 
-        inbound: Dict[str, Set[str]] = {fqn: set() for fqn in all_fqns}
+        inbound: Dict[str, Set[str]] = {function_id: set() for function_id in all_function_ids}
 
         include_requirements: Dict[str, List[str]] = {}
 
         for f in functions:
-            fqn = str(f.get("fqn") or "")
-            if not fqn:
+            function_id = str(f.get("unique_fqn") or f.get("fqn") or "")
+            if not function_id:
                 continue
 
             call_details = f.get("call_details", [])
@@ -288,26 +400,37 @@ class CppParser:
                     call_display = str(entry.get("display") or call_name)
                     normalized = self._normalize_call_target(call_name, call_display)
 
-                    target_fqn: Optional[str] = None
-                    if normalized in all_fqns:
-                        target_fqn = normalized
-                    elif normalized in name_to_fqn:
-                        target_fqn = name_to_fqn[normalized]
+                    if normalized in all_function_ids:
+                        if normalized != function_id:
+                            internal_calls.append(normalized)
+                            inbound[normalized].add(function_id)
+                        continue
 
-                    if target_fqn and target_fqn != fqn:
-                        internal_calls.append(target_fqn)
-                        inbound[target_fqn].add(fqn)
-                    elif call_display:
+                    if normalized in legacy_fqn_to_ids:
+                        for candidate_id in legacy_fqn_to_ids[normalized]:
+                            if candidate_id != function_id:
+                                internal_calls.append(candidate_id)
+                                inbound[candidate_id].add(function_id)
+                        continue
+
+                    if normalized in name_to_function_ids:
+                        overload_candidates = name_to_function_ids[normalized]
+                        for candidate_id in overload_candidates:
+                            if candidate_id != function_id:
+                                internal_calls.append(candidate_id)
+                                inbound[candidate_id].add(function_id)
+                        continue
+                    if call_display:
                         external_calls.append(call_display)
 
             internal_calls = sorted(set(internal_calls))
             external_calls = sorted(set(external_calls))
 
             includes_for_function = self._compute_include_requirements_for_function(f, headers)
-            include_requirements[fqn] = includes_for_function
+            include_requirements[function_id] = includes_for_function
 
             out_degree = len(internal_calls)
-            in_degree = len(inbound.get(fqn, set()))
+            in_degree = len(inbound.get(function_id, set()))
             is_leaf = out_degree == 0
             is_root = in_degree >= 2 and out_degree <= 1
 
@@ -318,7 +441,7 @@ class CppParser:
             merged["outgoing_calls_count"] = out_degree
             merged["is_leaf"] = is_leaf
             merged["is_root"] = is_root
-            function_map[fqn] = merged
+            function_map[function_id] = merged
 
         dependency_order = self._compute_modernization_priority(function_map)
 
@@ -330,6 +453,7 @@ class CppParser:
             "headers": headers,
             "types": types,
             "global_context": global_context,
+            "global_variables": global_variables,
         }
 
     def _normalize_call_target(self, call_name: str, call_display: str) -> str:
@@ -366,13 +490,24 @@ class CppParser:
     ) -> List[str]:
         body = str(function_meta.get("body") or "")
         signature = str(function_meta.get("signature") or "")
-        calls = function_meta.get("calls", [])
-        joined_calls = "\n".join([str(c) for c in calls]) if isinstance(calls, list) else ""
+        call_details = function_meta.get("call_details") or []
+        joined_calls = "\n".join(
+            str(entry.get("display") or entry.get("name") or "")
+            for entry in call_details
+            if isinstance(entry, dict)
+        )
         text = "\n".join([signature, body, joined_calls])
 
         required: List[str] = []
+        candidate_headers: Set[str] = set()
         for header_line in headers:
             header_name = self._extract_header_name(header_line)
+            if header_name:
+                candidate_headers.add(header_name)
+        candidate_headers.update(_STD_HEADER_SYMBOLS.keys())
+        candidate_headers.update(_TEMPLATE_SYMBOL_BASES.keys())
+
+        for header_name in sorted(candidate_headers):
             if not header_name:
                 continue
 
@@ -412,11 +547,16 @@ class CppParser:
 
     @staticmethod
     def _symbol_or_template_use(base_symbol: str, text: str) -> bool:
-        """Detect `std::symbol`, `symbol`, and templated uses such as `symbol<T>`."""
+        """Detect `std::symbol`, `symbol`, and templated uses such as `symbol<T>`.
+
+        The `std::` prefix must have no whitespace between `::` and the symbol
+        because `std:: vector` (with a space) is invalid C++.
+        """
         if not base_symbol:
             return False
-        plain_pattern = r"(?<!\w)(?:std::\s*)?" + re.escape(base_symbol) + r"(?!\w)"
-        template_pattern = r"(?<!\w)(?:std::\s*)?" + re.escape(base_symbol) + r"\s*<"
+        # `(?:std::)?` — no \s* after :: to reject the invalid `std:: symbol` form.
+        plain_pattern = r"(?<!\w)(?:std::)?" + re.escape(base_symbol) + r"(?!\w)"
+        template_pattern = r"(?<!\w)(?:std::)?" + re.escape(base_symbol) + r"\s*<"
         return re.search(plain_pattern, text) is not None or re.search(template_pattern, text) is not None
 
     @staticmethod
@@ -451,6 +591,7 @@ class CppParser:
         source_text: str,
         source_bytes: bytes,
         line_starts: List[int],
+        source_file: str = "",
     ) -> Dict[str, Any]:
         owner_node = self._ownership_node(node)
 
@@ -481,24 +622,53 @@ class CppParser:
 
         start_line = self._byte_to_line_number(ownership_start, line_starts)
         end_line = node.end_point[0] + 1
+        loc = max(1, end_line - start_line + 1)
 
         calls = self._collect_function_calls(node, source_bytes)
         modifiers = self._extract_modifiers(signature_text)
         parameters = self._extract_structured_parameters(node, source_bytes)
+        signature_hash = self._compute_signature_hash(parameters)
+        unique_fqn = f"{fqn}#{signature_hash}" if fqn else f"{function_name}#{signature_hash}"
+        lower_signature = signature_text.lower()
+        lower_body = body_text.lower()
+        loops = sum(
+            1 for sub in self._iter_nodes(node)
+            if sub.type in {"for_statement", "while_statement", "do_statement", "range_based_for_statement"}
+        )
+        branches = sum(
+            1 for sub in self._iter_nodes(node)
+            if sub.type in {"if_statement", "switch_statement", "conditional_expression"}
+        )
+        call_count = len(calls)
+        complexity = loops + branches + call_count
+        function_hash = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+        legacy_patterns = {
+            "has_raw_pointer": "*" in signature_text and "const" not in lower_signature,
+            "has_printf": "printf" in lower_body,
+            "has_malloc": "malloc" in lower_body,
+            "has_free": "free" in lower_body,
+            "has_null_macro": bool(re.search(r"\bNULL\b", body_text)),
+        }
 
         return {
             "fqn": fqn,
+            "unique_fqn": unique_fqn,
             "name": function_name,
             "signature": signature_text,
+            "signature_hash": signature_hash,
             "body": body_text,
             "parameters": parameters,
-            "calls": [call["display"] for call in calls],
             "call_details": calls,
             "start_byte": ownership_start,
             "end_byte": node.end_byte,
             "line_numbers": {"start": start_line, "end": end_line},
-            "is_template": owner_node.type == "template_declaration",
+            "loc": loc,
+            "is_template": owner_node.type == "template_declaration" or "template<" in lower_signature,
             "modifiers": modifiers,
+            "legacy_patterns": legacy_patterns,
+            "complexity": complexity,
+            "function_hash": function_hash,
+            "file_path": source_file,
         }
 
     def _build_type_record(
@@ -668,35 +838,8 @@ class CppParser:
         return ["<anonymous_function>"]
 
     def _extract_function_name(self, function_node: Any, source_bytes: bytes) -> str:
-        declarator = function_node.child_by_field_name("declarator")
-        search_root = declarator if declarator is not None else function_node
-
-        for found in self._iter_nodes(search_root):
-            if found.type in {"qualified_identifier", "scoped_identifier"}:
-                text = self._node_text(found, source_bytes).strip()
-                if text:
-                    return text.split("::")[-1].strip()
-
-        skipped_subtrees = {
-            "parameter_list",
-            "template_parameter_list",
-            "argument_list",
-        }
-
-        stack: List[Any] = [search_root]
-        while stack:
-            current = stack.pop()
-            if current.type in {"identifier", "field_identifier", "operator_name"}:
-                text = self._node_text(current, source_bytes).strip()
-                if text:
-                    return text
-
-            for child in reversed(current.children):
-                if child.type in skipped_subtrees:
-                    continue
-                stack.append(child)
-
-        return "<anonymous_function>"
+        """Return the unqualified function name (last component of the FQN)."""
+        return self._extract_function_qualified_parts(function_node, source_bytes)[-1]
 
     def _extract_structured_parameters(
         self, function_node: Any, source_bytes: bytes
@@ -827,6 +970,14 @@ class CppParser:
             if callee_node is None:
                 continue
 
+            if callee_node.type == "lambda_expression":
+                call_info = {"name": "<lambda>", "display": "<lambda>", "kind": "lambda"}
+                dedupe_key = (call_info["kind"], call_info["display"])
+                if dedupe_key not in seen:
+                    seen.add(dedupe_key)
+                    calls.append(call_info)
+                continue
+
             call_info = self._extract_callee_info(callee_node, source_bytes)
             if call_info is None:
                 continue
@@ -937,11 +1088,71 @@ class CppParser:
 
     def _iter_nodes(self, root: Any) -> Iterable[Any]:
         stack: List[Any] = [root]
+        count = 0
         while stack:
             current = stack.pop()
             yield current
+            count += 1
+            if count > MAX_AST_NODES:
+                break
             for child in reversed(current.children):
                 stack.append(child)
+
+    def _collect_global_variables(
+        self,
+        root_node: Any,
+        source_bytes: bytes,
+        line_starts: List[int],
+    ) -> List[Dict[str, Any]]:
+        variables: List[Dict[str, Any]] = []
+        for child in root_node.children:
+            if child.type != "declaration":
+                continue
+            decl_text = self._node_text(child, source_bytes).strip()
+            if not decl_text or "(" in decl_text or ")" in decl_text:
+                continue
+            names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b(?=\s*(?:=|;|,))", decl_text)
+            if not names:
+                continue
+            line = self._byte_to_line_number(child.start_byte, line_starts)
+            for name in names:
+                variables.append(
+                    {
+                        "name": name,
+                        "line": line,
+                        "declaration": decl_text,
+                    }
+                )
+        return variables
+
+    def export_ast_graph(self, source_text: str, output_path: str, max_nodes: int = 1000) -> str:
+        """Export a simplified AST graph in DOT format for debugging/demo use."""
+        try:
+            import importlib
+            graphviz_module = importlib.import_module("graphviz")
+            Digraph = getattr(graphviz_module, "Digraph")
+        except ImportError as exc:
+            raise RuntimeError("graphviz is required for export_ast_graph") from exc
+
+        source_bytes = source_text.encode("utf-8")
+        tree = self._parser.parse(source_bytes)
+        dot = Digraph("cpp_ast")
+
+        queue: List[Any] = [tree.root_node]
+        seen = 0
+        while queue and seen < max_nodes:
+            node = queue.pop(0)
+            node_id = f"n{node.start_byte}_{node.end_byte}_{seen}"
+            dot.node(node_id, label=node.type)
+            for child in node.children:
+                child_id = f"n{child.start_byte}_{child.end_byte}_{seen}_{child.type}"
+                dot.node(child_id, label=child.type)
+                dot.edge(node_id, child_id)
+                queue.append(child)
+            seen += 1
+
+        dot.save(output_path)
+        return output_path
 
 
 def extract_functions_from_cpp_file(file_path: str) -> List[Dict[str, Any]]:
@@ -1020,9 +1231,9 @@ def detect_legacy_patterns(source_text: str) -> List[Dict[str, Any]]:
                     "tag": "C++23 Overhaul",
                 }
             )
-    except Exception:
-        # If parser fails for any reason, keep regex-based findings only.
-        pass
+    except Exception as exc:
+        # Keep regex-based findings; log so the failure is visible in debug mode.
+        logger.debug("AST-based C-style cast detection failed: %s", exc, exc_info=True)
 
     findings.sort(key=lambda item: (int(item.get("line", 0)), str(item.get("pattern", ""))))
     return findings

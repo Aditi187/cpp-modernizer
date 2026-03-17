@@ -70,12 +70,12 @@ def _resolve_virtual_call_targets(
     method_to_fqns: Dict[str, List[str]],
     free_function_fqns: Dict[str, List[str]],
 ) -> List[str]:
-    """Resolve a virtual/polymorphic method call to a list of candidate FQNs.
+    """Resolve a virtual/polymorphic method call to candidate base FQNs.
 
     Resolution order:
     1. Exact match in the caller's own class (``caller_class::method_name``).
-    2. Walk up the inheritance hierarchy to find the first ancestor that
-       implements the method.
+     2. Walk up the inheritance hierarchy and return all ancestor implementations
+         that define the method (conservative for multiple inheritance).
     3. If the caller class is unknown, limit candidates to free functions only.
 
     Returns an empty list when *method_name* is not defined anywhere in the file
@@ -88,12 +88,13 @@ def _resolve_virtual_call_targets(
         exact = f"{caller_class}::{method_name}"
         if exact in candidates:
             return [exact]
-        # Walk up the hierarchy to find an inherited implementation.
+        # Walk up the hierarchy to find inherited implementations.
+        inherited_matches: List[str] = []
         for ancestor in _get_ancestors(caller_class, class_hierarchy):
             inherited = f"{ancestor}::{method_name}"
             if inherited in candidates:
-                return [inherited]
-        return []
+                inherited_matches.append(inherited)
+        return _ordered_unique(inherited_matches)
 
     return list(free_function_fqns.get(method_name, []))
 
@@ -132,6 +133,11 @@ def build_dependency_graph(
     functions_info: List[Dict[str, Any]],
     types_info: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[nx.DiGraph, Dict[str, List[str]], Dict[str, bool], List[str]]:
+    """Build an overload-aware call graph from function metadata.
+
+    Uses ``unique_fqn`` / ``signature_hash`` when available to prevent overload
+    collisions in lookup maps.
+    """
     graph: nx.DiGraph = nx.DiGraph()
     is_defined_in_file: Dict[str, bool] = {}
     defined_function_names: List[str] = []
@@ -142,7 +148,7 @@ def build_dependency_graph(
     method_to_fqns: Dict[str, List[str]] = {}
     free_function_fqns_by_name: Dict[str, List[str]] = {}
     name_to_defined_node_ids: Dict[str, List[str]] = {}
-    fqn_to_defined_node_id: Dict[str, str] = {}
+    fqn_to_defined_node_ids: Dict[str, List[str]] = {}
 
     for fn in functions_info:
         name = str(fn.get("name") or "")
@@ -150,9 +156,12 @@ def build_dependency_graph(
             continue
 
         parameters = fn.get("parameters") or []
-        sig_hash = _compute_signature_hash(parameters)
+        sig_hash = str(fn.get("signature_hash") or "")
+        if not sig_hash:
+            sig_hash = _compute_signature_hash(parameters)
         node_id = _make_node_id(name, sig_hash)
         fqn = str(fn.get("fqn") or name)
+        unique_fqn = str(fn.get("unique_fqn") or f"{fqn}#{sig_hash}")
         modifiers = fn.get("modifiers") or []
         is_virtual = "virtual" in modifiers
 
@@ -162,13 +171,15 @@ def build_dependency_graph(
             display_name=name,
             name=name,
             fqn=fqn,
+            unique_fqn=unique_fqn,
             signature_hash=sig_hash,
             is_virtual=is_virtual,
             is_defined_in_file=True,
+            is_function_like=True,
         )
 
         name_to_defined_node_ids.setdefault(name, []).append(node_id)
-        fqn_to_defined_node_id[fqn] = node_id
+        fqn_to_defined_node_ids.setdefault(fqn, []).append(node_id)
         is_defined_in_file[name] = True
         defined_function_names.append(name)
 
@@ -179,9 +190,11 @@ def build_dependency_graph(
 
     defined_function_names = _ordered_unique(defined_function_names)
 
-    def _ensure_external_node(raw_name: str) -> str:
+    def _ensure_external_node(raw_name: str, *, is_function_like: bool) -> str:
         external_name = str(raw_name or "")
         if not external_name:
+            return ""
+        if not is_function_like:
             return ""
         if not graph.has_node(external_name):
             graph.add_node(
@@ -190,10 +203,15 @@ def build_dependency_graph(
                 display_name=external_name,
                 name=external_name,
                 fqn=external_name,
+                unique_fqn=external_name,
                 signature_hash="",
                 is_virtual=False,
                 is_defined_in_file=False,
+                is_function_like=True,
             )
+        else:
+            attrs = graph.nodes[external_name]
+            attrs["is_function_like"] = bool(attrs.get("is_function_like", False) or is_function_like)
         if external_name not in is_defined_in_file:
             is_defined_in_file[external_name] = False
         return external_name
@@ -226,6 +244,14 @@ def build_dependency_graph(
                 call_display = str(detail.get("display") or call_name)
                 if not call_name:
                     continue
+                is_function_like_call = kind in {
+                    "method",
+                    "local",
+                    "scoped",
+                    "function_pointer",
+                    "functor",
+                    "lambda",
+                } or not kind
 
                 if kind == "method":
                     # Use inheritance-aware resolution for virtual/polymorphic calls.
@@ -238,21 +264,28 @@ def build_dependency_graph(
                     )
                     if resolved_fqns:
                         for target_fqn in resolved_fqns:
-                            target_node = fqn_to_defined_node_id.get(target_fqn)
-                            if target_node:
+                            target_nodes = fqn_to_defined_node_ids.get(target_fqn, [])
+                            for target_node in target_nodes:
                                 graph.add_edge(caller_node_id, target_node)
                     else:
-                        target_external = _ensure_external_node(call_display)
+                        target_external = _ensure_external_node(
+                            call_display,
+                            is_function_like=is_function_like_call,
+                        )
                         if target_external:
                             graph.add_edge(caller_node_id, target_external)
                 else:
                     # Local/scoped calls may refer to overloaded functions.
                     if "::" in call_display:
-                        target_node_id = fqn_to_defined_node_id.get(call_display)
-                        if target_node_id:
-                            graph.add_edge(caller_node_id, target_node_id)
+                        target_node_ids = fqn_to_defined_node_ids.get(call_display, [])
+                        if target_node_ids:
+                            for target_node_id in target_node_ids:
+                                graph.add_edge(caller_node_id, target_node_id)
                         else:
-                            target_external = _ensure_external_node(call_display)
+                            target_external = _ensure_external_node(
+                                call_display,
+                                is_function_like=is_function_like_call,
+                            )
                             if target_external:
                                 graph.add_edge(caller_node_id, target_external)
                         continue
@@ -263,7 +296,10 @@ def build_dependency_graph(
                             graph.add_edge(caller_node_id, target_node_id)
                         continue
 
-                    target_external = _ensure_external_node(call_name)
+                    target_external = _ensure_external_node(
+                        call_name,
+                        is_function_like=is_function_like_call,
+                    )
                     if target_external:
                         graph.add_edge(caller_node_id, target_external)
         else:
@@ -279,7 +315,7 @@ def build_dependency_graph(
                     for target_node_id in overload_targets:
                         graph.add_edge(caller_node_id, target_node_id)
                 else:
-                    target_external = _ensure_external_node(callee_name)
+                    target_external = _ensure_external_node(callee_name, is_function_like=True)
                     if target_external:
                         graph.add_edge(caller_node_id, target_external)
 
@@ -549,6 +585,12 @@ class DependencyGraph:
 
 
 def get_modernization_order(dependency_map: Dict[str, List[str]]) -> List[str]:
+    """Return modernization order from a name-level dependency map.
+
+    Warning: this helper is NOT overload-aware because ``dependency_map`` keys
+    are simple names. Prefer ``DependencyGraph.get_modernization_order`` when
+    overload-level precision is required.
+    """
     graph: nx.DiGraph = nx.DiGraph()
 
     for caller, callees in dependency_map.items():
