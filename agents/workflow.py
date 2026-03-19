@@ -19,6 +19,7 @@ sys.path.insert(0, _PROJECT_ROOT)
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Any, Optional
 import difflib
+import hashlib
 import importlib
 import json
 import os
@@ -27,8 +28,8 @@ from dotenv import load_dotenv
 
 load_dotenv(
     dotenv_path=os_module.path.join(_PROJECT_ROOT, ".env"),
-    override=True,
-)  # Load .env from project root explicitly and override inherited empty values.
+    override=False,
+)  # Load .env defaults but keep explicit runtime env var overrides.
 
 from core.parser import (
     CppParser,
@@ -42,60 +43,123 @@ from core.differential_tester import (
     run_differential_test,
     compile_cpp_source,
 )
-from core.local_ollama_bridge import (
-    CPP_MODERNIZATION_SYSTEM_PROMPT,
-    LocalOllamaBridge,
-)
-from core.gemini_bridge import GeminiBridge
-from core.openrouter_bridge import OpenRouterBridge
+from core.openai_bridge import CPP_MODERNIZATION_SYSTEM_PROMPT, OpenAIBridge
 from core.inspect_parser import score_cpp23_compliance
-from agents.function_modernizer import code_similarity_ratio
+from core.similarity import code_similarity_ratio
 from core.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 def _has_provider_api_key() -> bool:
-    return any(
-        os.environ.get(name, "").strip()
-        for name in ("GEMINI_API_KEY", "OPENROUTER_API_KEY", "CHATGPT_API_KEY", "OPENAI_API_KEY")
-    )
+    return bool(os.environ.get("API_KEY", "").strip())
+
+
+def _build_provider_bridge(provider: str) -> tuple[Any, str]:
+    if provider == "openai":
+        original_provider = os.environ.get("WORKFLOW_MODEL_PROVIDER")
+        os.environ["WORKFLOW_MODEL_PROVIDER"] = provider
+        bridge = OpenAIBridge.from_env(log_fn=logger.info)
+        if original_provider is None:
+            os.environ.pop("WORKFLOW_MODEL_PROVIDER", None)
+        else:
+            os.environ["WORKFLOW_MODEL_PROVIDER"] = original_provider
+        provider_name = str(getattr(getattr(bridge, "config", None), "provider", provider) or provider)
+        if provider_name != provider:
+            raise ValueError(f"Requested provider '{provider}' resolved to '{provider_name}'")
+        return bridge, provider_name
+    raise ValueError(f"Unsupported provider '{provider}'")
+
+
+def _provider_candidates() -> list[str]:
+    preferred_provider = os.environ.get("WORKFLOW_MODEL_PROVIDER", "").strip().lower()
+    has_api_key = _has_provider_api_key()
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _add(provider: str) -> None:
+        if provider not in seen:
+            seen.add(provider)
+            candidates.append(provider)
+
+    if preferred_provider == "openai":
+        _add(preferred_provider)
+
+    if has_api_key:
+        _add("openai")
+
+    if has_api_key and not candidates:
+        _add("openai")
+
+    if not candidates:
+        _add("openai")
+
+    return candidates
 
 
 def _select_model_bridge() -> tuple[Any, str]:
-    preferred_provider = os.environ.get("WORKFLOW_MODEL_PROVIDER", "").strip().lower()
-    if preferred_provider == "openrouter":
-        return OpenRouterBridge.from_env(log_fn=logger.info), "openrouter"
-    if preferred_provider in {"gemini", "openai"}:
-        bridge = GeminiBridge.from_env(log_fn=logger.info)
-        provider_name = str(getattr(getattr(bridge, "config", None), "provider", "gemini") or "gemini")
-        return bridge, provider_name
-    if preferred_provider == "ollama":
-        return LocalOllamaBridge.from_env(log_fn=logger.info), "ollama"
+    last_error: Exception | None = None
+    for provider in _provider_candidates():
+        try:
+            bridge, provider_name = _build_provider_bridge(provider)
+            logger.info("Selected provider '%s' for workflow", provider_name)
+            return bridge, provider_name
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Provider '%s' initialization failed: %r", provider, exc)
 
-    if os.environ.get("OPENROUTER_API_KEY", "").strip():
-        return OpenRouterBridge.from_env(log_fn=logger.info), "openrouter"
-    if _has_provider_api_key():
-        bridge = GeminiBridge.from_env(log_fn=logger.info)
-        provider_name = str(getattr(getattr(bridge, "config", None), "provider", "gemini") or "gemini")
-        return bridge, provider_name
-    bridge = LocalOllamaBridge.from_env(log_fn=logger.info)
-    return bridge, "ollama"
+    if last_error is not None:
+        raise RuntimeError(f"No model provider could be initialized. Last error: {last_error!r}") from last_error
+    raise RuntimeError("No model provider could be initialized. Set API_KEY.")
+
+
+_FALLBACK_BRIDGES: dict[str, Any] = {}
+
+
+def _get_or_create_bridge(provider: str) -> Any:
+    if provider not in _FALLBACK_BRIDGES:
+        bridge, _provider_name = _build_provider_bridge(provider)
+        _FALLBACK_BRIDGES[provider] = bridge
+    return _FALLBACK_BRIDGES[provider]
 
 
 _MODEL_BRIDGE, _MODEL_PROVIDER = _select_model_bridge()
 _MODEL_SYSTEM_PROMPT = "\n\n".join(
     [
         CPP_MODERNIZATION_SYSTEM_PROMPT,
-        "Return raw C++ only. No explanations, numbered lists, markdown fences, or commentary.",
-        "Preserve the function name and observable behavior unless the prompt explicitly allows a signature change.",
-        "If additional headers become necessary, include them only when returning a whole-file rewrite.",
-        "Example transformation:\nBefore:\nchar* s = (char*)malloc(10);\nfree(s);\nAfter:\nauto s = std::make_unique<char[]>(10);",
+        "MUST FOLLOW STRICTLY:",
+        "0) Target C++17 only. Absolutely no C++20/C++23 features.",
+        "0.1) Forbidden: concepts, std::ranges, coroutines, std::format, std::span, modules.",
+        "1) You MAY refactor function signatures and local data structures to safer modern C++17 constructs when behavior is preserved.",
+        "1.1) If a signature changes, update all in-file call sites consistently.",
+        "2) Preserve observable behavior.",
+        "3) Rewrite only the requested function(s); do not edit unrelated code.",
+        "4) Perform deep modernization inside target functions: RAII, std::unique_ptr, std::string, modern loops, nullptr, and safer ownership.",
+        "4.1) Replace C-style ownership patterns when safe: malloc/free/new/delete -> smart pointers, std::string, std::vector, std::array, or stack objects.",
+        "4.2) Do not keep manual heap management unless required by external ABI or binary interface constraints visible in this file.",
+        "4.3) Prefer expressive modern signatures (const refs, string_view where appropriate, return-by-value with move semantics) when behavior remains equivalent.",
+        "5) When compiler errors are provided, fix them and retain deep-modernized style.",
+        "6) Return ONLY code (no prose, no markdown fences, no lists, no commentary).",
+        "Output must compile as valid C++17 in the existing translation unit context.",
+        "Few-shot examples:",
+        "Example 1\nBefore:\nfor (int i = 0; i < v.size(); ++i) { sum += v[i]; }\nAfter:\nfor (const auto& item : v) { sum += item; }",
+        "Example 2\nBefore:\nif (ptr == NULL) return -1;\nAfter:\nif (ptr == nullptr) return -1;",
+        "Example 3\nBefore:\nint* p = new int(1);\nuse(*p);\ndelete p;\nAfter:\nauto p = std::make_unique<int>(1);\nuse(*p);",
     ]
 )
 _MODERNIZER_NODE_SIMILARITY_GUARD = 0.90
 _MAX_MODERNIZER_FUNCTION_CHARS = 3000
 _MODEL_OUTPUT_ATTEMPTS = 3
+_WORKFLOW_ALLOW_SIGNATURE_REFACTOR = os.environ.get("WORKFLOW_ALLOW_SIGNATURE_REFACTOR", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+try:
+    _MODEL_MIN_SCORE_DELTA = max(0, min(100, int(os.environ.get("WORKFLOW_MIN_SCORE_DELTA", "3").strip() or "3")))
+except ValueError:
+    _MODEL_MIN_SCORE_DELTA = 3
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -116,6 +180,59 @@ def _read_bounded_int_env(name: str, default: int, minimum: int, maximum: int) -
     return max(minimum, min(maximum, parsed))
 
 
+def _read_bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        parsed = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+_WORKFLOW_BATCH_SIZE = _read_bounded_int_env("WORKFLOW_BATCH_SIZE", 1, 1, 5)
+_WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION = _read_bounded_int_env("MAX_ATTEMPTS_PER_FUNCTION", 10, 1, 100)
+_WORKFLOW_STAGNANT_SCORE_LIMIT = _read_bounded_int_env("WORKFLOW_STAGNANT_SCORE_LIMIT", 10, 1, 100)
+_WORKFLOW_MIN_FINAL_SCORE = _read_bounded_int_env("WORKFLOW_MIN_FINAL_SCORE", 30, 0, 100)
+
+
+def _workflow_use_llm() -> bool:
+    explicit = os.environ.get("WORKFLOW_USE_LLM", "").strip()
+    if explicit:
+        return _read_bool_env("WORKFLOW_USE_LLM", True)
+    return not _read_bool_env("WORKFLOW_DISABLE_LLM", False)
+
+
+def _workflow_model_temperature() -> float:
+    return _read_bounded_float_env("LLM_TEMPERATURE", 0.1, 0.0, 1.0)
+
+
+def _safe_score_percent(payload: dict[str, Any]) -> int:
+    raw = payload.get("percent", 0)
+    try:
+        return int(float(str(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_provider_failure_message(message: str) -> bool:
+    upper_message = str(message or "").upper()
+    return any(
+        token in upper_message
+        for token in (
+            "PROVIDER_QUOTA_EXHAUSTED",
+            "MODEL_UNAVAILABLE",
+            "ALL_MODEL_PROVIDERS_FAILED",
+            "OLLAMA_REQUEST_FAILED",
+            "OLLAMA_CHAT_FAILED",
+            "429",
+            "402",
+            "TIMEOUT",
+        )
+    )
+
+
 _STRICT_CPP23_MODE = (
     _read_bool_env("WORKFLOW_STRICT_MODE", False)
     or _read_bool_env("CPP23_STRICT_MODE", False)
@@ -130,7 +247,47 @@ _STRICT_CPP23_TARGET_PERCENT = _read_bounded_int_env(
 
 def call_model(system_prompt: str, user_prompt: str) -> str:
     """Call the configured model bridge and let the bridge own generation tracing."""
-    return _MODEL_BRIDGE.chat_completion(system_prompt, user_prompt, start_new_trace=True)
+    try:
+        return _MODEL_BRIDGE.chat_completion(
+            system_prompt,
+            user_prompt,
+            temperature=_workflow_model_temperature(),
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as primary_exc:
+        primary_message = str(primary_exc)
+        should_fallback = _is_provider_failure_message(primary_message)
+        if not should_fallback:
+            raise
+
+        last_exc: Exception | None = None
+        for provider in _provider_candidates():
+            if provider == _MODEL_PROVIDER:
+                continue
+            try:
+                fallback_bridge = _get_or_create_bridge(provider)
+                logger.warning(
+                    "Primary provider '%s' failed (%s); trying fallback provider '%s'.",
+                    _MODEL_PROVIDER,
+                    primary_message,
+                    provider,
+                )
+                return fallback_bridge.chat_completion(
+                    system_prompt,
+                    user_prompt,
+                    temperature=_workflow_model_temperature(),
+                )
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as fallback_exc:
+                last_exc = fallback_exc
+                logger.warning("Fallback provider '%s' failed: %r", provider, fallback_exc)
+                continue
+        raise RuntimeError(
+            "ALL_MODEL_PROVIDERS_FAILED "
+            f"primary={primary_message}"
+        ) from (last_exc or primary_exc)
 
 
 def check_model_health() -> bool:
@@ -148,19 +305,18 @@ def _health_failure_guidance() -> str:
     normalized = str(message or "")
     if "429" in normalized:
         return (
-            "Provider rate limit detected (429). If you are using Gemini, wait exactly 60 seconds and rerun "
+            "Provider rate limit detected (429). Wait exactly 60 seconds and rerun "
             "`python agents/workflow.py`. Avoid repeated retries during that cooldown window."
         )
     if "402" in normalized:
         return (
-            "Provider billing/quota issue detected (402). OpenRouter is rejecting the request. "
-            "Use a funded OpenRouter key, switch to Gemini with `WORKFLOW_MODEL_PROVIDER=gemini`, "
-            "or fall back to a local Ollama code model."
+            "Provider billing/quota issue detected (402). The configured provider rejected the request. "
+            "Verify billing/quota for your OpenAI key, then rerun "
+            "`python agents/workflow.py`."
         )
-    if "OLLAMA" in normalized.upper() and ("NOT FOUND" in normalized.upper() or "UNREACHABLE" in normalized.upper()):
+    if "UNREACHABLE" in normalized.upper() or "CONNECTION REFUSED" in normalized.upper():
         return (
-            "Local Ollama is not ready. If you have at least 8 GB free RAM, run `ollama run deepseek-coder:6.7b` "
-            "in a terminal and then rerun the workflow."
+            "OpenAI API endpoint is not reachable. Check network access and OPENAI_ENDPOINT_BASE, then rerun the workflow."
         )
     return f"Provider startup failed: {normalized}"
 
@@ -180,6 +336,86 @@ def _parse_functions_from_source(source_code: str) -> list[dict[str, Any]]:
         return []
 
 
+def _parse_project_map_from_source(source_code: str) -> dict[str, Any]:
+    try:
+        parser = CppParser()
+        project_map = parser.parse_string(source_code)
+        if isinstance(project_map, dict):
+            return project_map
+        return {}
+    except Exception:
+        return {}
+
+
+def _index_functions_by_identifier(functions_info: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    for fn in functions_info:
+        identifier = _function_identifier(fn)
+        if identifier and identifier not in index:
+            index[identifier] = fn
+        stable_key = _function_stable_key(fn)
+        if stable_key and stable_key not in index:
+            index[stable_key] = fn
+    return index
+
+
+def _function_identifier(function_info: dict[str, Any]) -> str:
+    return str(function_info.get("unique_fqn") or function_info.get("fqn") or function_info.get("name") or "")
+
+
+def _function_stable_key(function_info: dict[str, Any]) -> str:
+    """Build a stable function key from declarative identity.
+
+    Format: <fqn-or-name-without-trailing-hash>#<signature_hash>
+    """
+    base_name = str(function_info.get("fqn") or function_info.get("name") or "")
+    if "#" in base_name:
+        base_name = base_name.split("#", 1)[0]
+
+    signature_hash = str(function_info.get("signature_hash") or "")
+    if not signature_hash:
+        signature_text = str(function_info.get("signature") or "")
+        normalized_signature = re.sub(r"/\*.*?\*/", " ", signature_text, flags=re.DOTALL)
+        normalized_signature = re.sub(r"//[^\n]*", " ", normalized_signature)
+        normalized_signature = re.sub(r"\s+", " ", normalized_signature).strip()
+        if normalized_signature:
+            signature_hash = hashlib.md5(normalized_signature.encode("utf-8")).hexdigest()[:8]
+        else:
+            parameters = function_info.get("parameters") or []
+            type_text = ",".join(str(p.get("type") or "") for p in parameters if isinstance(p, dict))
+            type_text = re.sub(r"\s+", " ", type_text).strip()
+            signature_hash = hashlib.md5(type_text.encode("utf-8")).hexdigest()[:8] if type_text else ""
+
+    if base_name and signature_hash:
+        return f"{base_name}#{signature_hash}"
+    if signature_hash:
+        return signature_hash
+    return base_name
+
+
+def _function_matches_identifier(function_info: dict[str, Any], identifier: str) -> bool:
+    ident = str(identifier or "")
+    if not ident:
+        return False
+    candidates = {
+        str(function_info.get("unique_fqn") or ""),
+        str(function_info.get("fqn") or ""),
+        str(function_info.get("name") or ""),
+        _function_stable_key(function_info),
+    }
+    return ident in candidates
+
+
+def _find_function_by_identifier(functions_info: list[dict[str, Any]], identifier: str) -> dict[str, Any]:
+    ident = str(identifier or "")
+    if not ident:
+        return {}
+    for fn in functions_info:
+        if _function_matches_identifier(fn, ident):
+            return fn
+    return {}
+
+
 def _build_callers_map(dependency_map: dict[str, list[str]]) -> dict[str, list[str]]:
     callers_map: dict[str, list[str]] = {name: [] for name in dependency_map.keys()}
     for caller_name, callees in dependency_map.items():
@@ -189,9 +425,9 @@ def _build_callers_map(dependency_map: dict[str, list[str]]) -> dict[str, list[s
     return callers_map
 
 
-# Regex to match DeepSeek special tokens like <｜begin▁of▁sentence｜> that leak
-# into generated code.  Handles both fullwidth (U+FF5C ｜) and ASCII pipe (|).
-_DEEPSEEK_SPECIAL_TOKEN_RE = re.compile(r"<[｜|][^>]{1,40}[｜|]>")
+# Regex to match model special tokens like <｜begin▁of▁sentence｜> that can leak
+# into generated code. Handles both fullwidth (U+FF5C ｜) and ASCII pipe (|).
+_MODEL_SPECIAL_TOKEN_RE = re.compile(r"<[｜|][^>]{1,40}[｜|]>")
 
 
 def _clean_model_code_block(text: str) -> str:
@@ -209,15 +445,19 @@ def _clean_model_code_block(text: str) -> str:
         # Fallback: strip any stray triple-backtick lines.
         cleaned = re.sub(r"```(?:[^\n]*)\n?", "", text)
         cleaned = cleaned.strip()
-    # Strip DeepSeek special tokens (e.g. <｜begin▁of▁sentence｜>) that the
+    # Strip model special tokens (e.g. <｜begin▁of▁sentence｜>) that the
     # model sometimes injects into its output.
-    cleaned = _DEEPSEEK_SPECIAL_TOKEN_RE.sub("", cleaned)
+    cleaned = _MODEL_SPECIAL_TOKEN_RE.sub("", cleaned)
     return cleaned
 
 
 def _looks_like_prose_response(raw_text: str, cleaned_text: str) -> bool:
-    lower_raw = raw_text.lower()
-    lower_cleaned = cleaned_text.lower()
+    raw_without_comments = re.sub(r"/\*.*?\*/", "", raw_text, flags=re.DOTALL)
+    raw_without_comments = re.sub(r"//[^\n]*", "", raw_without_comments)
+    cleaned_without_comments = re.sub(r"/\*.*?\*/", "", cleaned_text, flags=re.DOTALL)
+    cleaned_without_comments = re.sub(r"//[^\n]*", "", cleaned_without_comments)
+    lower_raw = raw_without_comments.lower()
+    lower_cleaned = cleaned_without_comments.lower()
     prose_markers = (
         "to modernize this function",
         "we can follow these steps",
@@ -230,11 +470,11 @@ def _looks_like_prose_response(raw_text: str, cleaned_text: str) -> bool:
     )
     if any(marker in lower_raw for marker in prose_markers):
         return True
-    if re.search(r"(?m)^\s*(?:\d+\.|[-*])\s+", cleaned_text):
+    if re.search(r"(?m)^\s*(?:\d+\.|[-*])\s+", cleaned_without_comments):
         return True
     if re.search(r"(?m)^\s*(?:\d+\.|[-*])\s+", raw_text) and "```" not in raw_text:
         return True
-    if "{" not in cleaned_text or "}" not in cleaned_text:
+    if "{" not in cleaned_without_comments or "}" not in cleaned_without_comments:
         return True
     if re.search(r"\b(?:steps?|explanation|summary|replace the line)\b", lower_cleaned):
         return True
@@ -245,13 +485,159 @@ def _build_retry_prompt(base_prompt: str, rejection_reason: str, rejected_respon
     response_preview = rejected_response.strip()[:500]
     return (
         base_prompt
-        + "\n\nCRITICAL RETRY INSTRUCTION: The previous response was rejected."
+        + "\n\nRETRY MODE (STRICT): The previous response was rejected."
         + f"\nReason: {rejection_reason}."
-        + "\nReturn ONLY valid C++ code for the target function."
+        + "\nReturn ONLY one full function definition for the same target function."
+        + (
+            "\nSignature refactors are allowed when they improve safety and modern C++17 usage; if changed, keep call-site compatibility within this file."
+            if _WORKFLOW_ALLOW_SIGNATURE_REFACTOR
+            else "\nKeep the exact function signature unchanged."
+        )
+        + "\nIf compiler errors are present in the prompt, enter FIX-ONLY mode: resolve only those errors with the smallest possible edits."
+        + "\nDo not introduce unrelated refactors, renames, reordering, or structural changes."
         + "\nDo not include explanations, lists, markdown fences, comments describing steps, or placeholders."
-        + "\nStart with the function signature and end with the matching closing brace."
+        + "\nStart with the function signature and end with its matching closing brace."
         + f"\nRejected response preview:\n{response_preview}"
     )
+
+
+def _extract_json_object_text(raw_text: str) -> str:
+    cleaned = _clean_model_code_block(raw_text).strip()
+    if cleaned.startswith("{") and cleaned.endswith("}"):
+        return cleaned
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    if match:
+        return match.group(0)
+    return ""
+
+
+def _batch_prompt_for_functions(
+    batch_entries: list[dict[str, Any]],
+    dependency_map: dict[str, list[str]],
+    previous_error_log: str,
+) -> str:
+    sections: list[str] = [
+        "Modernize the following C++ functions while preserving behavior and exact signatures.",
+        "Return STRICT JSON only in this exact shape:",
+        "{\"functions\":[{\"id\":\"<identifier>\",\"code\":\"<full_function_code>\"}]}",
+        "Rules: one full function definition per id, no markdown fences, no prose.",
+        "Rules: minimal/surgical diffs only, no unrelated changes outside each target function.",
+        "Rules: when compiler feedback is present, fix only those errors with minimal edits.",
+    ]
+
+    if previous_error_log:
+        sections.append("Recent compiler feedback:\n" + previous_error_log)
+
+    for entry in batch_entries:
+        function_name = str(entry.get("name") or "")
+        function_id = str(entry.get("identifier") or "")
+        called_by = ", ".join(sorted(dependency_map.get(function_name, []))) or "none"
+        function_code = str(entry.get("source") or "")
+        sections.append(
+            "\n".join(
+                [
+                    f"ID: {function_id}",
+                    f"Function: {function_name}",
+                    f"Direct callers: {called_by}",
+                    "Source:",
+                    "```cpp",
+                    function_code,
+                    "```",
+                ]
+            )
+        )
+    return "\n\n".join(sections)
+
+
+def _collect_batch_entries(
+    functions_info: list[dict[str, Any]],
+    functions_index: dict[str, dict[str, Any]],
+    modernization_order: list[str],
+    current_index: int,
+    source_to_improve: str,
+    batch_size: int,
+) -> list[dict[str, Any]]:
+    if batch_size <= 1:
+        return []
+
+    source_bytes = source_to_improve.encode("utf-8")
+    collected: list[dict[str, Any]] = []
+    scan_index = current_index
+    while scan_index < len(modernization_order) and len(collected) < batch_size:
+        identifier = str(modernization_order[scan_index] or "")
+        if not identifier:
+            scan_index += 1
+            continue
+
+        fn_info = functions_index.get(identifier, {})
+        if not fn_info:
+            for fn in functions_info:
+                if _function_matches_identifier(fn, identifier):
+                    fn_info = fn
+                    break
+        if not fn_info:
+            scan_index += 1
+            continue
+
+        start_byte = fn_info.get("start_byte")
+        end_byte = fn_info.get("end_byte")
+        if not (
+            isinstance(start_byte, int)
+            and isinstance(end_byte, int)
+            and 0 <= start_byte <= end_byte <= len(source_bytes)
+        ):
+            scan_index += 1
+            continue
+
+        function_source = source_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
+        if len(function_source) > _MAX_MODERNIZER_FUNCTION_CHARS:
+            scan_index += 1
+            continue
+
+        parameters = fn_info.get("parameters") or []
+        param_count = len(parameters) if isinstance(parameters, list) else -1
+        collected.append(
+            {
+                "identifier": identifier,
+                "name": str(fn_info.get("name") or ""),
+                "start_byte": start_byte,
+                "end_byte": end_byte,
+                "param_count": param_count,
+                "source": function_source,
+            }
+        )
+        scan_index += 1
+    return collected
+
+
+def _apply_batched_replacements(
+    source_to_improve: str,
+    batch_entries: list[dict[str, Any]],
+    candidate_by_id: dict[str, str],
+) -> tuple[str, list[str]]:
+    updated_source = source_to_improve
+    applied_ids: list[str] = []
+    for entry in sorted(batch_entries, key=lambda item: int(item["start_byte"]), reverse=True):
+        identifier = str(entry.get("identifier") or "")
+        function_name = str(entry.get("name") or "")
+        original_param_count = int(entry.get("param_count", -1))
+        candidate = str(candidate_by_id.get(identifier, "") or "").strip()
+        if not candidate:
+            continue
+
+        validation_error = _validate_single_function_candidate(candidate, function_name, original_param_count)
+        if validation_error:
+            continue
+
+        updated_source = _replace_function_by_span(
+            updated_source,
+            int(entry["start_byte"]),
+            int(entry["end_byte"]),
+            candidate,
+        )
+        updated_source = IncludeManager().update_file_includes(updated_source, candidate)
+        applied_ids.append(identifier)
+    return updated_source, applied_ids
 
 
 def _split_function_signature_and_body(function_source: str) -> tuple[str, str]:
@@ -423,18 +809,99 @@ def _replace_function_by_span(
     end_byte: int,
     replacement: str,
 ) -> str:
+    # Guard against corrupting the file when the model returns whole-file output.
+    if re.search(r"(?m)^\s*#\s*include\b", replacement):
+        raise ValueError("Replacement contains '#include' directives; expected a single function body.")
+    parsed_replacement_functions = _parse_functions_from_source(replacement)
+    if len(parsed_replacement_functions) != 1:
+        raise ValueError(
+            f"Replacement must contain exactly one function definition, got {len(parsed_replacement_functions)}."
+        )
+
     source_bytes = source_code.encode("utf-8")
     prefix = source_bytes[:start_byte]
     suffix = source_bytes[end_byte:]
     replacement_bytes = replacement.encode("utf-8")
     updated_bytes = prefix + replacement_bytes + suffix
-    return updated_bytes.decode("utf-8", errors="strict")
+    try:
+        return updated_bytes.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            "Replacement produced non-UTF-8 output. Ensure the input file is valid UTF-8 before modernization."
+        ) from exc
 
 
-def _extract_function_text_from_code(source_code: str, function_name: str) -> str:
+def _validate_single_function_candidate(
+    candidate_code: str,
+    expected_function_name: str,
+    original_param_count: int,
+) -> str | None:
+    """Return None when candidate is valid, else return rejection reason."""
+    if re.search(r"(?m)^\s*#\s*include\b", candidate_code):
+        return "model returned whole-file output with include directives"
+
+    parsed_map = _parse_project_map_from_source(candidate_code)
+    parsed_functions_obj = parsed_map.get("functions") or {}
+    if isinstance(parsed_functions_obj, dict):
+        parsed_functions = list(parsed_functions_obj.values())
+    else:
+        parsed_functions = [item for item in parsed_functions_obj if isinstance(item, dict)] if isinstance(parsed_functions_obj, list) else []
+    if len(parsed_functions) != 1:
+        return f"model output must contain exactly one function definition (got {len(parsed_functions)})"
+
+    candidate_name = str(parsed_functions[0].get("name") or "")
+    if candidate_name != expected_function_name:
+        return (
+            "model output function name mismatch "
+            f"(expected '{expected_function_name}', got '{candidate_name or 'unknown'}')"
+        )
+
+    if not _WORKFLOW_ALLOW_SIGNATURE_REFACTOR:
+        candidate_params = parsed_functions[0].get("parameters") or []
+        candidate_param_count = len(candidate_params) if isinstance(candidate_params, list) else -1
+        if (
+            original_param_count >= 0
+            and candidate_param_count >= 0
+            and original_param_count != candidate_param_count
+        ):
+            return (
+                "model changed parameter compatibility "
+                f"(expected {original_param_count} params, got {candidate_param_count})"
+            )
+
+    extra_types = parsed_map.get("types") or []
+    extra_globals = parsed_map.get("global_variables") or []
+    if extra_types or extra_globals:
+        return "model output contains extra top-level declarations"
+
+    # Fast heuristic checks for common LLM output mistakes before compile stage.
+    body_text = str(parsed_functions[0].get("body") or "")
+    if not body_text.strip():
+        return "model output has empty function body"
+
+    stripped_lines = [line.strip() for line in candidate_code.splitlines() if line.strip()]
+    for line in stripped_lines:
+        if line.startswith(("//", "/*", "*", "#", "return ")):
+            continue
+        if line.endswith(("{", "}", ";", ":")):
+            continue
+        if line.startswith(("if ", "if(", "for ", "for(", "while ", "while(", "switch ", "switch(", "else", "do")):
+            continue
+        if re.search(r"\bstd::(cout|cerr|clog)\b", line) and "<<" in line and not line.endswith(";"):
+            return "likely missing semicolon after stream output statement"
+
+    has_iostream_include = bool(re.search(r"(?m)^\s*#\s*include\s*<iostream>\s*$", candidate_code))
+    uses_iostream_streams = bool(re.search(r"\bstd::(cout|cerr|clog)\b", candidate_code))
+    if uses_iostream_streams and "#include" in candidate_code and not has_iostream_include:
+        return "uses std::cout/cerr/clog but missing #include <iostream>"
+
+    return None
+
+
+def _extract_function_text_from_code(source_code: str, function_identifier: str) -> str:
     functions_info = _parse_functions_from_source(source_code)
     for function_info in functions_info:
-        if str(function_info.get("name") or "") != function_name:
+        if not _function_matches_identifier(function_info, function_identifier):
             continue
         start_byte = function_info.get("start_byte")
         end_byte = function_info.get("end_byte")
@@ -688,9 +1155,63 @@ class ModernizationState(TypedDict):
     legacy_findings: list[dict[str, Any]]  # Static-analysis tags for legacy C/C++ regions needing C++23 overhaul.
     compliance_report: dict[str, Any]  # C++23 compliance score details for the current modernized candidate.
     functions_info: list[dict[str, Any]]  # Cached parser output for the current working code to avoid repeated full re-parsing.
+    functions_index: dict[str, dict[str, Any]]  # Index of function metadata keyed by unique identifier (unique_fqn preferred).
     current_function_name: str  # Name of the function currently being modernized.
     current_function_span: tuple[int, int]  # Byte span (start, end) of the current target function in the current working code.
     project_map: dict[str, Any]  # Cached Tree-sitter semantic map for the current working source.
+    use_llm: bool  # Whether LLM-based modernization is enabled for this run.
+    llm_available: bool  # Whether at least one model provider is currently available.
+    llm_fallback_reason: str  # Reason text when the workflow switches to deterministic no-LLM fallback mode.
+    batched_target_functions: list[str]  # Function identifiers modernized in the current batched request.
+    current_target_stable_key: str  # Stable signature-based key for the current target function.
+    last_function_scores: dict[str, int]  # Last modernization score observed for each target function.
+    function_stagnation_counts: dict[str, int]  # Consecutive attempts with unchanged score per function.
+
+
+def _update_function_stagnation(state: ModernizationState, code_snapshot: str) -> None:
+    target_stable_key = str(state.get("current_target_stable_key") or "")
+    target_identifier = str(state.get("current_target_function") or "")
+    if not target_stable_key and not target_identifier:
+        return
+
+    function_text = ""
+    if target_identifier:
+        function_text = _extract_function_text_from_code(code_snapshot, target_identifier)
+    if not function_text and target_stable_key:
+        parsed_functions = _parse_functions_from_source(code_snapshot)
+        matched = _find_function_by_identifier(parsed_functions, target_stable_key)
+        if matched:
+            start_byte = matched.get("start_byte")
+            end_byte = matched.get("end_byte")
+            if isinstance(start_byte, int) and isinstance(end_byte, int):
+                code_bytes = code_snapshot.encode("utf-8")
+                function_text = code_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
+    if not function_text:
+        return
+
+    function_score = _safe_score_percent(score_cpp23_compliance(function_text))
+    last_scores = dict(state.get("last_function_scores") or {})
+    stagnation_counts = dict(state.get("function_stagnation_counts") or {})
+
+    score_key = target_stable_key or target_identifier
+    previous_score = last_scores.get(score_key)
+    if previous_score is not None and previous_score == function_score:
+        stagnation_counts[score_key] = int(stagnation_counts.get(score_key, 0)) + 1
+    else:
+        stagnation_counts[score_key] = 0
+
+    last_scores[score_key] = function_score
+    state["last_function_scores"] = last_scores
+    state["function_stagnation_counts"] = stagnation_counts
+
+    logger.info(
+        "Function progress: %s score=%d stagnation=%d/%d body=%s",
+        score_key,
+        function_score,
+        int(stagnation_counts.get(score_key, 0)),
+        _WORKFLOW_STAGNANT_SCORE_LIMIT,
+        hashlib.sha256(function_text.encode("utf-8")).hexdigest()[:10],
+    )
 
 
 def analyzer_node(state: ModernizationState) -> ModernizationState:
@@ -707,7 +1228,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     logger.info("Language: %s", state['language'])
     logger.debug("Input Code (first 200 chars):\n%s...", state['code'][:200])
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether the language label indicates C++, which is when we want to use the Tree-sitter parser.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++17", "c++20", "c++23"}  # This line checks whether the language label indicates C++, which is when we want to use the Tree-sitter parser.
 
     functions_info = []  # type: ignore[var-annotated]  # This variable will hold the list of functions discovered by the parser, if any.
     dependency_map: dict[str, list[str]] = {}  # This dictionary will map each function name to the list of functions it calls.
@@ -718,6 +1239,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     call_graph_data: dict[str, Any] = {}  # This dictionary will store a JSON-serializable view of the call graph.
     legacy_findings: list[dict[str, Any]] = []
     project_map: dict[str, Any] = {}
+    dep_graph: DependencyGraph | None = None
 
     if is_cpp:  # This condition ensures we only run the C++ parser when we are actually working with C++ code.
         try:  # This try block attempts to run the parser on the current C++ source text and build a dependency graph.
@@ -769,14 +1291,23 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     state["analysis_report"] = analysis_report  # This line stores the human-readable report so it can be included in prompts if desired.
     state["legacy_findings"] = legacy_findings
     state["functions_info"] = list(functions_info)
+    state["functions_index"] = _index_functions_by_identifier(functions_info)
     state["project_map"] = dict(project_map)
 
     if is_cpp and functions_info:
-        state["modernization_order"] = dep_graph.get_modernization_order()
+        if dep_graph is not None:
+            state["modernization_order"] = dep_graph.get_modernization_order()
+        else:
+            state["modernization_order"] = [
+                _function_identifier(fn)
+                for fn in functions_info
+                if _function_identifier(fn)
+            ]
     else:
         state["modernization_order"] = []
     state["modernized_functions"] = {}
     state["current_function_index"] = 0
+    state["current_target_stable_key"] = ""
     state["current_function_name"] = ""
     state["current_function_span"] = (0, 0)
     state["partial_success"] = False
@@ -888,7 +1419,15 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
 
     state["code"] = pruned_code  # This line updates the state with the pruned source code so the modernizer works on a smaller, focused input.
     state["last_working_code"] = pruned_code  # Keep subsequent passes anchored to the pruned baseline so removed orphans do not come back.
-    state["functions_info"] = _parse_functions_from_source(pruned_code)
+    pruned_project_map = _parse_project_map_from_source(pruned_code)
+    pruned_functions_obj = pruned_project_map.get("functions") or {}
+    if isinstance(pruned_functions_obj, dict):
+        pruned_functions = list(pruned_functions_obj.values())
+    else:
+        pruned_functions = [item for item in pruned_functions_obj if isinstance(item, dict)] if isinstance(pruned_functions_obj, list) else []
+    state["project_map"] = dict(pruned_project_map)
+    state["functions_info"] = pruned_functions
+    state["functions_index"] = _index_functions_by_identifier(pruned_functions)
 
     # Remove pruned functions from the modernization order so the modernizer
     # does not attempt to re-add them.
@@ -913,19 +1452,24 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     if state["error_log"]:  # This condition checks whether the verifier or tester reported any previous issues.
         logger.info("Previous Feedback:\n%s", state['error_log'])
 
-    # Prefer the last known compiling snapshot as our base, then fall back.
-    source_to_improve = (
-        state.get("last_working_code")
-        or state["modernized_code"]
-        or state["code"]
-    )
+    # On retry after verifier feedback, keep the last failed candidate so the model can
+    # perform a minimal compile-fix patch instead of restarting from an older snapshot.
+    if state.get("error_log") and state.get("modernized_code"):
+        source_to_improve = state["modernized_code"]
+    else:
+        source_to_improve = (
+            state.get("last_working_code")
+            or state["modernized_code"]
+            or state["code"]
+        )
 
     logger.debug("Source Snapshot (preview):\n%s...", source_to_improve[:200])
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ so we know whether to ask for C++23 modernization.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++17", "c++20", "c++23"}  # This line checks whether we are working with C++ so we know whether to ask for C++ modernization.
 
     modernized = source_to_improve  # This line initializes the modernized code to the source as a safe default in case the model call fails.
     state["current_target_function"] = ""
+    state["current_target_stable_key"] = ""
     state["current_function_name"] = ""
     state["current_function_span"] = (0, 0)
 
@@ -943,8 +1487,8 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         current_index = int(state.get("current_function_index", 0))
 
         while current_index < len(modernization_order):
-            candidate_name = str(modernization_order[current_index])
-            has_candidate = any(str(fn.get("name") or "") == candidate_name for fn in functions_info)
+            candidate_identifier = str(modernization_order[current_index])
+            has_candidate = any(_function_matches_identifier(fn, candidate_identifier) for fn in functions_info)
             if has_candidate:
                 break
             current_index += 1
@@ -956,15 +1500,22 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             return state
 
         state["current_function_index"] = current_index
-        current_function_name = str(modernization_order[current_index]) if modernization_order else ""
-        state["current_target_function"] = current_function_name
-        state["current_function_name"] = current_function_name
+        current_function_identifier = str(modernization_order[current_index]) if modernization_order else ""
+        state["current_target_function"] = current_function_identifier
 
-        current_function_info: dict[str, Any] = {}
-        for fn in functions_info:
-            if str(fn.get("name") or "") == current_function_name:
-                current_function_info = fn
-                break
+        functions_index = state.get("functions_index") or _index_functions_by_identifier(functions_info)
+        current_function_info: dict[str, Any] = functions_index.get(current_function_identifier, {})
+        if not current_function_info:
+            for fn in functions_info:
+                if _function_matches_identifier(fn, current_function_identifier):
+                    current_function_info = fn
+                    break
+
+        current_function_name = str(current_function_info.get("name") or "")
+        state["current_target_stable_key"] = _function_stable_key(current_function_info)
+        state["current_function_name"] = current_function_name
+        original_parameters = current_function_info.get("parameters") or []
+        original_param_count = len(original_parameters) if isinstance(original_parameters, list) else -1
 
         start_byte = current_function_info.get("start_byte")
         end_byte = current_function_info.get("end_byte")
@@ -974,7 +1525,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
             and isinstance(end_byte, int)
             and 0 <= start_byte <= end_byte <= len(source_bytes)
         ):
-            warning = f"Missing valid byte span for function '{current_function_name}', skipping."
+            warning = f"Missing valid byte span for function '{current_function_identifier}', skipping."
             logger.warning("%s", warning)
             state["error_log"] = warning
             state["attempt_count"] += 1
@@ -983,9 +1534,10 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
         state["current_function_span"] = (start_byte, end_byte)
         function_source = source_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
+        original_quality_score = _safe_score_percent(score_cpp23_compliance(function_source))
         if len(function_source) > _MAX_MODERNIZER_FUNCTION_CHARS:
             warning = (
-                f"Skipping large function '{current_function_name}' "
+                f"Skipping large function '{current_function_identifier}' "
                 f"({len(function_source)} chars > {_MAX_MODERNIZER_FUNCTION_CHARS})."
             )
             logger.warning("%s", warning)
@@ -1002,7 +1554,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         ]
         legacy_pattern_summary = ", ".join(sorted(set(legacy_patterns))) if legacy_patterns else "none"
 
-        _rule_preview_function, transform_notes = _apply_rule_based_function_transforms(function_source)
+        rule_based_candidate, transform_notes = _apply_rule_based_function_transforms(function_source)
 
         if transform_notes:
             logger.info("Rule-based transforms applied: %s", ", ".join(transform_notes))
@@ -1014,9 +1566,10 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
         callers_display = ", ".join(callers) if callers else "none"
         prompt_parts: list[str] = []
         prompt_parts.append(
-            "Rewrite ONLY this function to modern C++23 while preserving behavior. "
-            "You MUST apply at least one modernization. Returning identical code is NOT allowed. "
-            "Examples: printf -> std::print, raw pointer -> std::unique_ptr, manual loop -> ranges. "
+            "Rewrite ONLY this function to deeply modern C++17 while preserving behavior. "
+            "You MUST apply meaningful modernization and avoid legacy ownership/manual memory patterns. Returning identical code is NOT allowed. "
+            "Prefer RAII, std::unique_ptr, std::string, nullptr, and safer interfaces. "
+            "Signature refactors are allowed when they improve safety; update in-file call sites as needed. "
             "Return ONLY the updated function."
         )
         prompt_parts.append(f"Function name: {current_function_name}")
@@ -1033,15 +1586,116 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
         if state["error_log"]:
             prompt_parts.append(
-                "Compiler errors from the previous attempt for this same function:\n"
-                f"{state['error_log']}"
+                "Compiler/parity feedback from the previous attempt for this same function:\n"
+                f"{state['error_log']}\n\n"
+                "FIX-FOCUSED MODE: resolve reported issues while preserving deep-modernized style. "
+                "Avoid unrelated edits, but do not regress to legacy ownership patterns."
             )
 
         prompt_parts.append(
-            "Rules: do not output markdown fences, do not output the whole file, do not change function name/signature incompatibly."
+            "Rules: no markdown fences, do not output the whole file, preserve surrounding structure, keep C++17 compatibility only, and prioritize deep modernization over minimal diff."
         )
 
         full_prompt = "\n\n".join(prompt_parts)  # This line joins all prompt sections together with blank lines so the text is readable and well structured.
+        state["batched_target_functions"] = []
+
+        llm_enabled = bool(state.get("use_llm", True))
+        llm_available = bool(state.get("llm_available", True))
+        if not llm_enabled or not llm_available:
+            fallback_reason = state.get("llm_fallback_reason") or (
+                "LLM mode disabled by WORKFLOW_USE_LLM/WORKFLOW_DISABLE_LLM"
+                if not llm_enabled
+                else "Model providers unavailable; using deterministic rule-based fallback"
+            )
+            logger.warning("Modernizer running in no-LLM fallback mode: %s", fallback_reason)
+
+            if transform_notes and rule_based_candidate != function_source:
+                try:
+                    modernized = _replace_function_by_span(
+                        source_to_improve,
+                        start_byte,
+                        end_byte,
+                        rule_based_candidate,
+                    )
+                    modernized = IncludeManager().update_file_includes(modernized, rule_based_candidate)
+                    refreshed_project_map = _parse_project_map_from_source(modernized)
+                    refreshed_functions_obj = refreshed_project_map.get("functions") or {}
+                    if isinstance(refreshed_functions_obj, dict):
+                        refreshed_functions = list(refreshed_functions_obj.values())
+                    else:
+                        refreshed_functions = [item for item in refreshed_functions_obj if isinstance(item, dict)] if isinstance(refreshed_functions_obj, list) else []
+                    state["project_map"] = dict(refreshed_project_map)
+                    state["functions_info"] = refreshed_functions
+                    state["functions_index"] = _index_functions_by_identifier(refreshed_functions)
+                    state["error_log"] = "no-LLM fallback applied: " + ", ".join(transform_notes)
+                except ValueError as replacement_exc:
+                    warning = f"No-LLM fallback replacement failed for '{current_function_identifier}': {replacement_exc}"
+                    logger.warning("%s", warning)
+                    state["error_log"] = warning
+                    modernized = source_to_improve
+            else:
+                warning = (
+                    f"No-LLM fallback found no deterministic rewrite for '{current_function_identifier}'."
+                )
+                logger.warning("%s", warning)
+                state["error_log"] = warning
+                modernized = source_to_improve
+
+            state["modernized_code"] = modernized
+            state["attempt_count"] += 1
+            return state
+
+        if _WORKFLOW_BATCH_SIZE > 1:
+            batch_entries = _collect_batch_entries(
+                functions_info=functions_info,
+                functions_index=functions_index,
+                modernization_order=modernization_order,
+                current_index=current_index,
+                source_to_improve=source_to_improve,
+                batch_size=_WORKFLOW_BATCH_SIZE,
+            )
+            if len(batch_entries) > 1:
+                batch_prompt = _batch_prompt_for_functions(
+                    batch_entries=batch_entries,
+                    dependency_map=callers_map,
+                    previous_error_log=state.get("error_log", ""),
+                )
+                try:
+                    raw_batch_text = call_model(_MODEL_SYSTEM_PROMPT, batch_prompt)
+                    batch_json_text = _extract_json_object_text(raw_batch_text)
+                    parsed_batch = json.loads(batch_json_text) if batch_json_text else {}
+                    batch_items = parsed_batch.get("functions") if isinstance(parsed_batch, dict) else []
+                    candidate_by_id: dict[str, str] = {}
+                    for item in batch_items if isinstance(batch_items, list) else []:
+                        if not isinstance(item, dict):
+                            continue
+                        identifier = str(item.get("id") or "").strip()
+                        code = str(item.get("code") or "").strip()
+                        if identifier and code:
+                            candidate_by_id[identifier] = code
+
+                    batched_source, applied_ids = _apply_batched_replacements(
+                        source_to_improve=source_to_improve,
+                        batch_entries=batch_entries,
+                        candidate_by_id=candidate_by_id,
+                    )
+                    if len(applied_ids) > 1 and batched_source != source_to_improve:
+                        logger.info("Batch modernization applied for %d functions in one API call.", len(applied_ids))
+                        refreshed_project_map = _parse_project_map_from_source(batched_source)
+                        refreshed_functions_obj = refreshed_project_map.get("functions") or {}
+                        if isinstance(refreshed_functions_obj, dict):
+                            refreshed_functions = list(refreshed_functions_obj.values())
+                        else:
+                            refreshed_functions = [item for item in refreshed_functions_obj if isinstance(item, dict)] if isinstance(refreshed_functions_obj, list) else []
+                        state["project_map"] = dict(refreshed_project_map)
+                        state["functions_info"] = refreshed_functions
+                        state["functions_index"] = _index_functions_by_identifier(refreshed_functions)
+                        state["modernized_code"] = batched_source
+                        state["batched_target_functions"] = applied_ids
+                        state["attempt_count"] += 1
+                        return state
+                except Exception as batch_exc:
+                    logger.warning("Batch modernization attempt failed; falling back to single-function mode: %r", batch_exc)
 
         try:
             cleaned_candidate = ""
@@ -1057,20 +1711,28 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                     rejection_reason = "model returned empty function output"
                 elif _looks_like_prose_response(raw_text, cleaned_candidate):
                     rejection_reason = "model returned prose or non-code instructions"
-                elif current_function_name not in cleaned_candidate:
+                elif current_function_name and current_function_name not in cleaned_candidate:
                     rejection_reason = f"model output does not contain function name '{current_function_name}'"
-                elif code_similarity_ratio(function_source, cleaned_candidate) > _MODERNIZER_NODE_SIMILARITY_GUARD:
-                    rejection_reason = "model returned nearly identical code"
                 else:
-                    rejection_reason = ""
-                    break
+                    validation_error = _validate_single_function_candidate(
+                        cleaned_candidate,
+                        current_function_name,
+                        original_param_count,
+                    )
+                    if validation_error:
+                        rejection_reason = validation_error
+                    elif code_similarity_ratio(function_source, cleaned_candidate) > _MODERNIZER_NODE_SIMILARITY_GUARD:
+                        rejection_reason = "model returned nearly identical code"
+                    else:
+                        rejection_reason = ""
+                        break
 
                 logger.warning("Rejecting model output attempt %d: %s.", model_attempt, rejection_reason)
                 if model_attempt < _MODEL_OUTPUT_ATTEMPTS:
                     prompt_for_attempt = _build_retry_prompt(full_prompt, rejection_reason, raw_text)
 
             if rejection_reason:
-                warning = f"Model returned unusable output for '{current_function_name}': {rejection_reason}."
+                warning = f"Model returned unusable output for '{current_function_identifier}': {rejection_reason}."
                 logger.warning("%s", warning)
                 state["error_log"] = warning
                 modernized = source_to_improve
@@ -1086,19 +1748,65 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
                 )
                 if diff_lines:
                     logger.debug("\n".join(diff_lines))
-                modernized = _replace_function_by_span(
-                    source_to_improve,
-                    start_byte,
-                    end_byte,
-                    cleaned_candidate,
-                )
+                try:
+                    modernized = _replace_function_by_span(
+                        source_to_improve,
+                        start_byte,
+                        end_byte,
+                        cleaned_candidate,
+                    )
+                except ValueError as replacement_exc:
+                    replacement_rejection = (
+                        f"Model output rejected during replacement validation: {replacement_exc}"
+                    )
+                    logger.warning("%s", replacement_rejection)
+                    state["error_log"] = replacement_rejection
+                    modernized = source_to_improve
+                    state["attempt_count"] += 1
+                    state["modernized_code"] = modernized
+                    return state
 
                 # Keep header updates in place, but only derive required includes from
                 # the rewritten function content.
                 modernized = IncludeManager().update_file_includes(modernized, cleaned_candidate)
+
+                # Refresh cached metadata immediately after a successful replacement
+                # so subsequent function lookups always use current byte spans.
+                refreshed_project_map = _parse_project_map_from_source(modernized)
+                refreshed_functions_obj = refreshed_project_map.get("functions") or {}
+                if isinstance(refreshed_functions_obj, dict):
+                    refreshed_functions = list(refreshed_functions_obj.values())
+                else:
+                    refreshed_functions = [item for item in refreshed_functions_obj if isinstance(item, dict)] if isinstance(refreshed_functions_obj, list) else []
+                state["project_map"] = dict(refreshed_project_map)
+                state["functions_info"] = refreshed_functions
+                state["functions_index"] = _index_functions_by_identifier(refreshed_functions)
         except Exception as exc:
             error_message = f"Model call failed in modernizer: {exc!r}"
             logger.error("%s", error_message)
+            if _is_provider_failure_message(error_message):
+                state["llm_available"] = False
+                state["llm_fallback_reason"] = str(exc)
+                if transform_notes and rule_based_candidate != function_source:
+                    try:
+                        modernized = _replace_function_by_span(
+                            source_to_improve,
+                            start_byte,
+                            end_byte,
+                            rule_based_candidate,
+                        )
+                        modernized = IncludeManager().update_file_includes(modernized, rule_based_candidate)
+                        refreshed_project_map = _parse_project_map_from_source(modernized)
+                        refreshed_functions_obj = refreshed_project_map.get("functions") or {}
+                        if isinstance(refreshed_functions_obj, dict):
+                            refreshed_functions = list(refreshed_functions_obj.values())
+                        else:
+                            refreshed_functions = [item for item in refreshed_functions_obj if isinstance(item, dict)] if isinstance(refreshed_functions_obj, list) else []
+                        state["project_map"] = dict(refreshed_project_map)
+                        state["functions_info"] = refreshed_functions
+                        state["functions_index"] = _index_functions_by_identifier(refreshed_functions)
+                    except ValueError:
+                        modernized = source_to_improve
             if state["error_log"]:
                 state["error_log"] += f"\n{error_message}"
             else:
@@ -1125,7 +1833,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
     code_to_verify = state["modernized_code"]  # This line uses only the modernized_code field, because we want to compile exactly what the modernizer produced.
 
     if not code_to_verify.strip():  # This condition checks if the AI returned no code (empty or whitespace-only); if so, we stop the workflow entirely.
-        message = "CRITICAL: Gemini returned no code. Check your model selection, API key, and max token settings."  # This line sets a precise failure message for empty AI output.
+        message = "CRITICAL: Model returned no code. Check your model selection, API key, and max token settings."  # This line sets a precise failure message for empty AI output.
         logger.error("%s", message)
         verification_result = {  # This dictionary records a failure result so the workflow can finish without calling the compiler.
             "success": False,  # This field marks the verification as a failure because there was nothing to compile.
@@ -1137,12 +1845,13 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         }  # This closing brace ends the verification_result dictionary for the empty-code case.
         state["verification_result"] = verification_result  # This line stores the failure result in the shared state.
         state["error_log"] = message  # This line copies the exact error message into the error log for visibility in later inspection.
-        state["attempt_count"] = 3  # This line sets attempts to max retry budget so the router safely terminates.
+        state["attempt_count"] = _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION  # This line sets attempts to max retry budget so the router safely terminates.
         logger.error("❌ Verification FAILED: %s", message)
         return state  # This return exits early so we do not try to call g++ with empty input.
 
     verification_result = compile_cpp_source(code_to_verify)
     state["verification_result"] = verification_result
+    _update_function_stagnation(state, code_to_verify)
 
     if verification_result["success"]:  # This condition checks whether compilation finished successfully without errors.
         logger.info("✅ Verification PASSED")
@@ -1154,9 +1863,16 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             compliance_percent = int(float(str(compliance_raw)))
         except (TypeError, ValueError):
             compliance_percent = 0
-        logger.info("C++23 Compliance Score: %d%%", compliance_percent)
+        logger.info("Modernization score: %d%%", compliance_percent)
 
         # Refresh parser/cache + dependency graph/order after each successful function replacement.
+        previous_functions_info = list(state.get("functions_info") or [])
+        previous_target_identifier = str(state.get("current_target_function") or "")
+        previous_target_stable_key = str(state.get("current_target_stable_key") or "")
+        previous_target_info = _find_function_by_identifier(previous_functions_info, previous_target_identifier)
+        if not previous_target_stable_key and previous_target_info:
+            previous_target_stable_key = _function_stable_key(previous_target_info)
+
         parser = CppParser()
         refreshed_project_map = parser.parse_string(
             state["modernized_code"],
@@ -1169,6 +1885,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             refreshed_functions = []
         state["project_map"] = dict(refreshed_project_map)
         state["functions_info"] = refreshed_functions
+        state["functions_index"] = _index_functions_by_identifier(refreshed_functions)
 
         refreshed_dep_graph = DependencyGraph(refreshed_functions)
         state["dependency_map"] = refreshed_dep_graph.dependency_map
@@ -1178,20 +1895,77 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
             state["modernization_order"] = refreshed_dep_graph.get_modernization_order()
 
         target_function = state.get("current_target_function") or ""
+        target_stable_key = previous_target_stable_key
         if target_function:
+            logger.debug(
+                "Completion mapping before refresh: target_identifier=%s target_stable_key=%s",
+                target_function,
+                target_stable_key,
+            )
+
+        updated_function_code = ""
+        updated_key = ""
+        if target_stable_key:
+            refreshed_target = _find_function_by_identifier(refreshed_functions, target_stable_key)
+            if refreshed_target:
+                start_byte = refreshed_target.get("start_byte")
+                end_byte = refreshed_target.get("end_byte")
+                if isinstance(start_byte, int) and isinstance(end_byte, int):
+                    code_bytes = state["modernized_code"].encode("utf-8")
+                    updated_function_code = code_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
+                    updated_key = _function_stable_key(refreshed_target)
+        if not updated_function_code and target_function:
             updated_function_code = _extract_function_text_from_code(
                 state["modernized_code"],
                 target_function,
             )
             if updated_function_code:
-                modernized_functions = state.get("modernized_functions") or {}
-                modernized_functions[target_function] = updated_function_code
-                state["modernized_functions"] = modernized_functions
+                refreshed_target = _find_function_by_identifier(refreshed_functions, target_function)
+                updated_key = _function_stable_key(refreshed_target) if refreshed_target else (target_stable_key or target_function)
+
+        if updated_function_code:
+            modernized_functions = state.get("modernized_functions") or {}
+            modernized_functions[updated_key or target_stable_key or target_function] = updated_function_code
+            state["modernized_functions"] = modernized_functions
+            logger.debug(
+                "Completion mapping after refresh: recorded_key=%s completed_count=%d",
+                updated_key or target_stable_key or target_function,
+                len(modernized_functions),
+            )
+
+        batched_targets = [str(item) for item in (state.get("batched_target_functions") or []) if str(item)]
+        if batched_targets:
+            modernized_functions = state.get("modernized_functions") or {}
+            for identifier in batched_targets:
+                batch_target = _find_function_by_identifier(refreshed_functions, identifier)
+                updated_function_code = ""
+                stable_batch_key = ""
+                if batch_target:
+                    start_byte = batch_target.get("start_byte")
+                    end_byte = batch_target.get("end_byte")
+                    if isinstance(start_byte, int) and isinstance(end_byte, int):
+                        code_bytes = state["modernized_code"].encode("utf-8")
+                        updated_function_code = code_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
+                    stable_batch_key = _function_stable_key(batch_target)
+                if not updated_function_code:
+                    updated_function_code = _extract_function_text_from_code(
+                        state["modernized_code"],
+                        identifier,
+                    )
+                if updated_function_code:
+                    modernized_functions[stable_batch_key or identifier] = updated_function_code
+            state["modernized_functions"] = modernized_functions
+        state["batched_target_functions"] = []
 
         completed_functions = set((state.get("modernized_functions") or {}).keys())
         next_index = 0
         updated_order = state.get("modernization_order") or []
-        while next_index < len(updated_order) and str(updated_order[next_index]) in completed_functions:
+        while next_index < len(updated_order):
+            order_identifier = str(updated_order[next_index])
+            order_target = _find_function_by_identifier(refreshed_functions, order_identifier)
+            order_stable_key = _function_stable_key(order_target) if order_target else order_identifier
+            if order_stable_key not in completed_functions:
+                break
             next_index += 1
         state["current_function_index"] = next_index
     else:  # This branch handles the case where g++ returned at least one error.
@@ -1204,15 +1978,21 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         critical_fix_section = ""
         if error_lines:
             first_error_line = error_lines[0]
-            focused_snippet = _get_code_snippet_by_line(code_to_verify, first_error_line)
+            first_three_lines = error_lines[:3]
+            snippets: list[str] = []
+            for ln in first_three_lines:
+                focused_snippet = _get_code_snippet_by_line(code_to_verify, ln)
+                if focused_snippet:
+                    snippets.append(f"Line {ln}:\n{focused_snippet}")
             critical_fix_section = (
                 "\n\nCRITICAL FIX REQUIRED: "
                 f"The compiler reported an error at Line {first_error_line}. "
                 "Look specifically at this logic:\n"
-                f"{focused_snippet}"
+                f"{'\n\n'.join(snippets)}"
             )
 
         state["error_log"] = combined_error + critical_fix_section
+        state["batched_target_functions"] = []
         logger.warning("Compile failed, keeping modernization for inspection.")
         logger.warning("Errors from g++:\n%s", state['error_log'])
 
@@ -1236,7 +2016,7 @@ def tester_node(state: ModernizationState) -> ModernizationState:
     state["is_functionally_equivalent"] = True  # This line assumes functional equivalence until the tester proves otherwise.
     state["diff_output"] = ""  # This line clears any previous diff output.
 
-    is_cpp = state["language"].lower() in {"cpp", "c++", "c++20", "c++23"}  # This line checks whether we are working with C++ code.
+    is_cpp = state["language"].lower() in {"cpp", "c++", "c++17", "c++20", "c++23"}  # This line checks whether we are working with C++ code.
     if not is_cpp:
         logger.info("Tester: skipping (non-C++ language).")
         return state  # This return leaves the state unchanged for non-C++ code.
@@ -1293,9 +2073,6 @@ def verify_node(state: ModernizationState) -> ModernizationState:
     current_index = int(compiled_state.get("current_function_index", 0))
     modernization_order = compiled_state.get("modernization_order") or []
     if current_index < len(modernization_order):
-        compiled_state["is_parity_passed"] = True
-        compiled_state["is_functionally_equivalent"] = True
-        compiled_state["diff_output"] = ""
         logger.info("Tester: deferred until final function is modernized.")
         return compiled_state
 
@@ -1311,13 +2088,64 @@ def surgical_router(state: ModernizationState) -> str:
     back to the modernizer node to process the next function; otherwise ends.
     """
     verification_success = bool(state["verification_result"].get("success"))
-    parity_passed = bool(state.get("is_parity_passed", False))
     attempt_count = int(state.get("attempt_count", 0))
+    current_target_function = str(state.get("current_target_stable_key") or state.get("current_target_function") or "")
+    stagnation_counts = state.get("function_stagnation_counts") or {}
+    current_stagnation = int(stagnation_counts.get(current_target_function, 0)) if current_target_function else 0
 
-    if parity_passed and verification_success:
+    if verification_success:
         # Check if more functions remain to be modernized.
         current_index = int(state.get("current_function_index", 0))
         modernization_order = state.get("modernization_order") or []
+        compliance_percent = _safe_score_percent(state.get("compliance_report") or {})
+
+        if (
+            current_index >= len(modernization_order)
+            and modernization_order
+            and compliance_percent < _WORKFLOW_MIN_FINAL_SCORE
+        ):
+            if attempt_count < _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION:
+                refreshed_functions = list(state.get("functions_info") or [])
+                if not refreshed_functions:
+                    refreshed_functions = _parse_functions_from_source(str(state.get("modernized_code") or ""))
+                retry_order = [
+                    str(fn.get("name") or "")
+                    for fn in refreshed_functions
+                    if str(fn.get("name") or "")
+                ]
+                if retry_order:
+                    state["modernization_order"] = retry_order
+                    state["current_function_index"] = 0
+                    state["current_target_function"] = str(retry_order[0])
+                    state["functions_info"] = list(refreshed_functions)
+                    state["functions_index"] = _index_functions_by_identifier(refreshed_functions)
+                    state["modernized_functions"] = {}
+                    state["batched_target_functions"] = []
+                else:
+                    state["partial_success"] = True
+                    logger.warning(
+                        "Cannot build retry order for low-score rerun; finishing with PARTIAL_SUCCESS."
+                    )
+                    logger.info("\n🏁 Routing to END (PARTIAL_SUCCESS: low-score rerun unavailable)")
+                    return "end"
+                state["error_log"] = (
+                    f"Modernization depth score {compliance_percent}% is below required "
+                    f"minimum {_WORKFLOW_MIN_FINAL_SCORE}% for final output."
+                )
+                logger.info(
+                    "\n🔄 Routing back to MODERNIZER (final score %d%% < required %d%%)",
+                    compliance_percent,
+                    _WORKFLOW_MIN_FINAL_SCORE,
+                )
+                return "modernizer"
+
+            state["partial_success"] = True
+            logger.warning(
+                "Final score %d%% is below required %d%% after max attempts; finishing with PARTIAL_SUCCESS.",
+                compliance_percent,
+                _WORKFLOW_MIN_FINAL_SCORE,
+            )
+
         if current_index < len(modernization_order):
             logger.info("\n🔄 Routing back to MODERNIZER (next function: %s)", modernization_order[current_index])
             # Reset attempt counter and error log for the next function.
@@ -1327,7 +2155,25 @@ def surgical_router(state: ModernizationState) -> str:
         logger.info("\n🏁 Routing to END (SUCCESS: all functions modernized)")
         return "end"
 
-    if attempt_count >= 3:
+    if current_target_function and current_stagnation >= _WORKFLOW_STAGNANT_SCORE_LIMIT:
+        current_index = int(state.get("current_function_index", 0))
+        modernization_order = state.get("modernization_order") or []
+        state["current_function_index"] = current_index + 1
+        state["partial_success"] = True
+        state["attempt_count"] = 0
+        state["error_log"] = ""
+        logger.warning(
+            "\n⏭️ Skipping stuck function '%s' after %d unchanged-score attempt(s).",
+            current_target_function,
+            current_stagnation,
+        )
+        if current_index + 1 < len(modernization_order):
+            logger.info("\n🔄 Routing to MODERNIZER (next: %s)", modernization_order[current_index + 1])
+            return "modernizer"
+        logger.info("\n🏁 Routing to END (PARTIAL_SUCCESS: stuck function skipped)")
+        return "end"
+
+    if attempt_count >= _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION:
         # Current function exhausted retries — skip it and try the next one.
         current_index = int(state.get("current_function_index", 0))
         modernization_order = state.get("modernization_order") or []
@@ -1336,18 +2182,14 @@ def surgical_router(state: ModernizationState) -> str:
             state["partial_success"] = True
             state["attempt_count"] = 0
             state["error_log"] = ""
-            logger.info("\n🔄 Skipping failed function, routing to MODERNIZER (next: %s)", modernization_order[current_index + 1])
+            logger.info("\n🔄 Skipping failed function after max attempts, routing to MODERNIZER (next: %s)", modernization_order[current_index + 1])
             return "modernizer"
         state["partial_success"] = True
-        logger.info("\n🏁 Routing to END (PARTIAL_SUCCESS after max attempts)")
+        logger.info("\n🏁 Routing to END (PARTIAL_SUCCESS after max attempts=%d)", _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION)
         return "end"
 
-    if attempt_count < 3 and not verification_success:
+    if attempt_count < _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION and not verification_success:
         logger.info("\n🔄 Routing back to MODERNIZER (compiler failure, surgical retry)")
-        return "modernizer"
-
-    if attempt_count < 3 and not parity_passed:
-        logger.info("\n🔄 Routing back to MODERNIZER (parity failure, surgical retry)")
         return "modernizer"
 
     logger.info("\n🏁 Routing to END")
@@ -1387,7 +2229,29 @@ def build_workflow():
     return workflow.compile()
 
 
-def run_modernization_workflow(code: str, language: str = "c++23", source_file: str = "", output_file_path: str = ""):
+def _warmup_workflow_runtime(use_llm: bool) -> tuple[bool, str]:
+    """Warm parser/model readiness before the first graph invocation."""
+    try:
+        CppParser().parse_string("int __workflow_warmup__() { return 0; }")
+        logger.info("Warmup: parser ready.")
+    except Exception as exc:
+        logger.warning("Warmup: parser preflight failed: %r", exc)
+
+    if not use_llm:
+        return False, "LLM explicitly disabled by workflow configuration"
+
+    try:
+        is_healthy, message = _MODEL_BRIDGE.check_health()
+    except Exception as exc:
+        return False, f"Model warmup health check failed: {exc!r}"
+
+    if is_healthy:
+        logger.info("Warmup: model provider '%s' is healthy (%s)", _MODEL_PROVIDER, message)
+        return True, ""
+    return False, _health_failure_guidance()
+
+
+def run_modernization_workflow(code: str, language: str = "c++17", source_file: str = "", output_file_path: str = ""):
     """
     Executes the modernization workflow with provided code
     """
@@ -1397,6 +2261,10 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
 
     source_abs = os.path.abspath(source_file) if source_file else ""
     normalized_output_path = os.path.abspath(output_file_path) if output_file_path else ""
+    use_llm = _workflow_use_llm()
+    llm_available, llm_fallback_reason = _warmup_workflow_runtime(use_llm)
+    if use_llm and not llm_available:
+        logger.warning("Warmup degraded to no-LLM fallback mode: %s", llm_fallback_reason)
 
     if normalized_output_path:
         output_dir = os.path.dirname(normalized_output_path)
@@ -1428,6 +2296,7 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
         last_working_code=code,
         current_target_function="",
         functions_info=[],
+        functions_index={},
         current_function_name="",
         current_function_span=(0, 0),
         project_map={},
@@ -1435,6 +2304,13 @@ def run_modernization_workflow(code: str, language: str = "c++23", source_file: 
         output_file_path=normalized_output_path,
         legacy_findings=[],
         compliance_report={},
+        use_llm=use_llm,
+        llm_available=llm_available,
+        llm_fallback_reason=llm_fallback_reason,
+        batched_target_functions=[],
+        current_target_stable_key="",
+        last_function_scores={},
+        function_stagnation_counts={},
     )
     
     # Build and run the workflow
@@ -1516,9 +2392,9 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
     _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # This line gets the project root directory where test.cpp lives.
     _test_cpp_path = os.path.join(_base_dir, "test.cpp")  # This line builds the full path to test.cpp in the project root.
 
-    if not check_model_health():
-        logger.error(_health_failure_guidance())
-        exit(1)
+    if _workflow_use_llm() and not check_model_health():
+        logger.warning("%s", _health_failure_guidance())
+        logger.warning("Continuing with deterministic no-LLM fallback mode.")
 
     try:
         with open(_test_cpp_path, "r", encoding="utf-8") as f:
@@ -1528,7 +2404,7 @@ if __name__ == "__main__":  # This block runs only when this file is executed as
         logger.error("❌ test.cpp not found at %s", _test_cpp_path)
         exit(1)
         
-    result = run_modernization_workflow(cpp_code, language="c++23", source_file=_test_cpp_path)  # This line invokes the full workflow (prune -> analyze -> transform -> verify with retries) on the loaded code.
+    result = run_modernization_workflow(cpp_code, language="c++17", source_file=_test_cpp_path)  # This line invokes the full workflow (prune -> analyze -> transform -> verify with retries) on the loaded code.
     verification_ok = bool(result.get("verification_result", {}).get("success"))
     fail_on_verification = os.environ.get("WORKFLOW_FAIL_ON_VERIFICATION", "0").strip() == "1"
     if not verification_ok and fail_on_verification:

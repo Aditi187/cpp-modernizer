@@ -10,28 +10,35 @@ typedef struct {
     char* raw_data;
     size_t len;
 } LegacyRecord;
-
-// Hard to modernize: returns raw pointer, uses malloc, and return codes for errors
 int load_record(LegacyRecord** out_rec, int id) {
-    if (id <= 0) return -1; // Error code
+    if (out_rec == nullptr || id <= 0) return -1; // Error code
 
-    *out_rec = (LegacyRecord*)malloc(sizeof(LegacyRecord));
-    (*out_rec)->id = id;
-    
+    *out_rec = nullptr;
+    LegacyRecord* rec = static_cast<LegacyRecord*>(malloc(sizeof(LegacyRecord)));
+    if (rec == nullptr) return -1;
+
+    rec->id = id;
+
     const char* dummy = "DEVICE_DATA_STREAM_0xCF";
-    (*out_rec)->len = strlen(dummy);
-    (*out_rec)->raw_data = (char*)malloc((*out_rec)->len + 1);
-    strcpy((*out_rec)->raw_data, dummy);
-    
+    rec->len = strlen(dummy);
+    rec->raw_data = static_cast<char*>(malloc(rec->len + 1));
+    if (rec->raw_data == nullptr) {
+        free(rec);
+        return -1;
+    }
+
+    memcpy(rec->raw_data, dummy, rec->len + 1);
+    *out_rec = rec;
+
     return 0; // Success code
 }
 
 void process_data() {
-    LegacyRecord* rec = NULL;
+    LegacyRecord* rec = nullptr;
     // Pointer to pointer logic is a great test for std::expected and smart pointers
     if (load_record(&rec, 42) == 0) {
         printf("Processing Record %d: %s\n", rec->id, rec->raw_data);
-        
+
         // Manual cleanup often forgotten by lazy AI
         free(rec->raw_data);
         free(rec);
@@ -40,12 +47,7 @@ void process_data() {
     }
 }
 
-#include <iostream>
-using namespace std;
-
 int main() {
-    int a = 10, b = 20;
-    cout << "a = " << a << ", b = " << b << endl; // Outputs "a = 10, b = 20"
-    
+    process_data();
     return 0;
 }

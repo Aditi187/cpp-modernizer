@@ -14,6 +14,9 @@ networkx
 # Vector store (optional, used by ChromaDB-backed tools)
 chromadb
 
+# Embeddings (optional, used by CodeRAG)
+sentence-transformers
+
 # HTTP client (OpenRouter API)
 requests
 
@@ -21,4 +24,4 @@ requests
 python-dotenv
 
 # Observability
-langfuse
+langfuse>=2.0.0

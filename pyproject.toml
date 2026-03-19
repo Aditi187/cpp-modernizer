@@ -24,9 +24,10 @@ dependencies = [
     "tree-sitter-cpp",
     "networkx",
     "chromadb",
+    "sentence-transformers",
     "requests",
     "python-dotenv",
-    "langfuse",
+    "langfuse>=2.0.0",
 ]
 
 [project.optional-dependencies]
@@ -37,8 +38,7 @@ dev = [
 ]
 
 [project.scripts]
-# If you have a main entry point, e.g.:
-# modernization-engine = "core.main:main"
+modernization-engine = "cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

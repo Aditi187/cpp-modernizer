@@ -1,44 +1,382 @@
+"""
+Differential testing framework for C++ code modernization.
+
+This module compiles both original and modernized C++ code, runs them with test inputs,
+and reports parity (output, exit code, memory usage, sanitizer diagnostics).
+
+Thread Safety: NOT thread-safe. Concurrent calls to run_differential_test can race on
+_COMPILER_CAPABILITIES_CACHE. Use external locking or create separate instances per thread.
+
+Security: This module executes compiled binaries from provided source code. Timeouts
+reduce risk but do not provide full sandbox isolation. Use in trusted environments only.
+
+Limitations:
+- Sanitizer diagnostics are platform-dependent (Linux/macOS only for ASan/UBSan).
+- Memory peak measurement requires /usr/bin/time or psutil; may return None.
+- Crash detection is heuristic-based; UB may not always be caught.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from difflib import unified_diff
-from typing import Any
+from typing import Any, Optional
 
+# Attempt to import psutil for cross-platform memory monitoring
+try:
+    import psutil
+    HAS_PSUTIL = True
+except ImportError:
+    HAS_PSUTIL = False
 
-# ---------------------------------------------------------------------------
-# Sanitizer configuration
-# ---------------------------------------------------------------------------
+_log = logging.getLogger(__name__)
 
-_SANITIZER_COMPILE_FLAGS: list[str] = [
+# ==================== Module-Level Constants ====================
+
+# Set to track verified compilers (not yet tried or already verified)
+_VERIFIED_COMPILERS: set[str] = set()
+
+# Sanitizer compilation flags (default; can be overridden via TesterConfig)
+_SANITIZER_COMPILE_FLAGS = [
     "-fsanitize=address,undefined",
     "-fno-omit-frame-pointer",
 ]
+
+# Regex to detect crash indicators in stderr output
+_CRASH_STDERR_PATTERN = re.compile(
+    r"(?:segmentation fault|access violation|illegal instruction|"
+    r"floating point exception|aborted|stack overflow|core dumped|"
+    r"SUMMARY:|ERROR:\s*(?:address|leak|undefined))",
+    re.IGNORECASE,
+)
+
+# ==================== Configuration ====================
+
+
+@dataclass(frozen=True)
+class TesterConfig:
+    """Configuration for differential testing behavior.
+    
+    All fields can be overridden via environment variables (uppercase, with TESTER_ prefix).
+    Example: TESTER_COMPILE_TIMEOUT_SECONDS=20
+    
+    Attributes:
+        compile_timeout_seconds: Max time (seconds) to compile code.
+        run_timeout_seconds: Max time (seconds) to run a single test case.
+        enable_sanitizers_modernized: Enable ASan/UBSan on modernized code.
+        sanitize_original: Enable sanitizers on original code too (for comparison).
+        compiler_path: Explicit path to C++ compiler; auto-detected if empty.
+        sanitizer_flags: Additional flags for sanitizer compilation.
+        filter_sanitizer_stderr: Strip sanitizer lines from stderr before comparison.
+        max_test_cases: Max number of test cases to run (0 = unlimited).
+        debug: Enable debug logging.
+    """
+    
+    compile_timeout_seconds: int = 10
+    run_timeout_seconds: int = 10
+    enable_sanitizers_modernized: bool = True
+    sanitize_original: bool = False
+    compiler_path: str = ""
+    sanitizer_flags: list[str] = field(default_factory=lambda: [
+        "-fsanitize=address,undefined",
+        "-fno-omit-frame-pointer",
+    ])
+    filter_sanitizer_stderr: bool = True
+    max_test_cases: int = 0
+    debug: bool = False
+    
+    @classmethod
+    def from_env(cls) -> TesterConfig:
+        """Load configuration from environment variables."""
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(f"TESTER_{name}".upper(), str(default)))
+            except ValueError:
+                return default
+        
+        def _env_bool(name: str, default: bool) -> bool:
+            val = os.environ.get(f"TESTER_{name}".upper(), "").lower()
+            if val in ("true", "1", "yes"):
+                return True
+            if val in ("false", "0", "no"):
+                return False
+            return default
+        
+        return cls(
+            compile_timeout_seconds=_env_int("compile_timeout_seconds", 10),
+            run_timeout_seconds=_env_int("run_timeout_seconds", 10),
+            enable_sanitizers_modernized=_env_bool("enable_sanitizers_modernized", True),
+            sanitize_original=_env_bool("sanitize_original", False),
+            compiler_path=os.environ.get("TESTER_COMPILER_PATH", "").strip(),
+            filter_sanitizer_stderr=_env_bool("filter_sanitizer_stderr", True),
+            max_test_cases=_env_int("max_test_cases", 0),
+            debug=_env_bool("debug", False),
+        )
+
+
+# ==================== Compiler Detection & Caching ====================
+
+
+@dataclass
+class CompilerCapabilities:
+    """Detected capabilities of a C++ compiler.
+    
+    Attributes:
+        compiler_path: Canonical path to the compiler executable.
+        version_string: Output of --version.
+        supports_cpp17: Whether -std=c++17 is supported.
+        supports_sanitizers: Whether ASan/UBSan flags are supported.
+        supports_asan_stderr_capture: Whether ASan output goes to stderr (not syslog).
+    """
+    
+    compiler_path: str
+    version_string: str
+    supports_cpp17: bool = False
+    supports_sanitizers: bool = False
+    supports_asan_stderr_capture: bool = False
+
+
+_COMPILER_CAPABILITIES_CACHE: dict[str, CompilerCapabilities] = {}
+_COMPILER_CAPABILITIES_LOCK = threading.Lock()
+
+
+def detect_compiler_capabilities(
+    compiler_path: str, timeout_seconds: int = 5
+) -> CompilerCapabilities:
+    """
+    Detect compiler capabilities via test compilations.
+    
+    Results are cached per compiler path. Uses a lock for thread safety.
+    
+    Args:
+        compiler_path: Path to C++ compiler executable.
+        timeout_seconds: Timeout for test compilation.
+    
+    Returns:
+        CompilerCapabilities instance with detected capabilities.
+    
+    Raises:
+        RuntimeError: If compiler is not accessible or test fails critically.
+    """
+    with _COMPILER_CAPABILITIES_LOCK:
+        if compiler_path in _COMPILER_CAPABILITIES_CACHE:
+            _log.debug(f"Cache hit for compiler capabilities: {compiler_path}")
+            return _COMPILER_CAPABILITIES_CACHE[compiler_path]
+    
+    _log.debug(f"Detecting compiler capabilities for: {compiler_path}")
+    
+    # Get version string
+    try:
+        result = subprocess.run(
+            [compiler_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+        version_string = (result.stdout or "").strip().split("\n")[0]
+    except Exception as exc:
+        raise RuntimeError(f"Failed to get compiler version: {exc}") from exc
+    
+    # Test C++17 support
+    supports_cpp17 = _test_compiler_flag(compiler_path, "-std=c++17", timeout_seconds)
+    
+    # Test sanitizer support
+    supports_sanitizers = _test_compiler_flag(
+        compiler_path,
+        "-fsanitize=address",
+        timeout_seconds,
+    )
+    
+    # Test ASan stderr capture (ASan outputs to stderr, not syslog)
+    supports_asan_stderr = supports_sanitizers  # Assume true if sanitizers work
+    
+    capabilities = CompilerCapabilities(
+        compiler_path=compiler_path,
+        version_string=version_string,
+        supports_cpp17=supports_cpp17,
+        supports_sanitizers=supports_sanitizers,
+        supports_asan_stderr_capture=supports_asan_stderr,
+    )
+    
+    with _COMPILER_CAPABILITIES_LOCK:
+        _COMPILER_CAPABILITIES_CACHE[compiler_path] = capabilities
+    
+    _log.debug(
+        f"Compiler capabilities: C++17={supports_cpp17}, Sanitizers={supports_sanitizers}"
+    )
+    
+    return capabilities
+
+
+def _test_compiler_flag(
+    compiler_path: str, flag: str, timeout_seconds: int
+) -> bool:
+    """
+    Test if compiler accepts a given flag via a minimal compilation.
+    
+    Args:
+        compiler_path: Path to compiler.
+        flag: Flag to test (e.g., "-std=c++17").
+        timeout_seconds: Compilation timeout.
+    
+    Returns:
+        True if flag is accepted; False otherwise.
+    """
+    test_code = "int main() { return 0; }\n"
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cpp_file = os.path.join(tmp, "test.cpp")
+            exe_file = os.path.join(tmp, "test.exe")
+            with open(cpp_file, "w") as f:
+                f.write(test_code)
+            
+            result = subprocess.run(
+                [compiler_path, flag, cpp_file, "-o", exe_file],
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+            return result.returncode == 0
+    except Exception as exc:
+        _log.debug(f"Compiler flag test failed for {flag}: {exc}")
+        return False
+
+
+# ==================== Platform-Specific Utilities ====================
+
+
+def _detect_crash_reason(
+    exit_code: int | None,
+    stderr_text: str,
+    timed_out: bool,
+    platform_name: str | None = None,
+) -> str:
+    """
+    Infer crash reason from exit code and stderr in a platform-aware way.
+    
+    Handles Unix signals (negative exit codes) and Windows exception codes.
+    
+    Args:
+        exit_code: Process exit code (can be negative on Unix).
+        stderr_text: Captured stderr output.
+        timed_out: Whether the process timed out.
+        platform_name: Override platform detection (for testing).
+    
+    Returns:
+        Human-readable crash reason, or empty string if no crash.
+    """
+    if timed_out:
+        return "timeout"
+    
+    if exit_code is None:
+        return "execution_error"
+    
+    current_platform = platform_name or platform.system()
+    
+    # Check for crash indicators in stderr
+    crash_patterns = re.compile(
+        r"segmentation fault|access violation|illegal instruction|"
+        r"floating point exception|aborted|stack overflow|core dumped",
+        re.IGNORECASE,
+    )
+    if crash_patterns.search(stderr_text or ""):
+        return "Process crashed (detected from stderr)."
+    
+    # Negative exit code on Unix = signal termination
+    if exit_code < 0:
+        signal_num = -exit_code
+        if current_platform != "Windows":
+            try:
+                sig_name = signal.Signals(signal_num).name
+                return f"Process terminated by signal {signal_num} ({sig_name})."
+            except (ValueError, AttributeError):
+                return f"Process terminated by signal {signal_num}."
+        else:
+            # Windows: map exception codes
+            win_exceptions = {
+                0xC0000005: "Access Violation",
+                0xC0000000: "Not Implemented",
+                0x80000001: "Undefined Opcode",
+                0xC000009E: "Privileged Instruction",
+                0xC0000008: "Invalid Handle",
+            }
+            reason = win_exceptions.get(
+                signal_num & 0xFFFFFFFF, "Unknown Exception"
+            )
+            return f"Process terminated with exception {signal_num:#x} ({reason})."
+    
+    if exit_code != 0:
+        return f"Process exited with non-zero status {exit_code}."
+    
+    return ""
+
+
+def _get_peak_memory_kb(stderr_text: str) -> int | None:
+    """
+    Extract peak memory from /usr/bin/time -v or ASan output.
+    
+    Tries multiple parsers in order of preference:
+    1. GNU time -v format (most reliable)
+    2. ASan stats
+    3. Returns None if not found
+    
+    Args:
+        stderr_text: Captured stderr (may contain time or ASan output).
+    
+    Returns:
+        Peak memory in KB, or None if unavailable.
+    """
+    if not stderr_text:
+        return None
+    
+    # GNU time -v format
+    match = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr_text)
+    if match:
+        return int(match.group(1))
+    
+    # ASan bytes -> KB conversion
+    match = re.search(r"(\d+)\s+byte\(s\)\s+allocated", stderr_text)
+    if match:
+        return max(1, int(match.group(1)) // 1024)
+    
+    return None
+
+
+# ==================== Patterns & Filtering ====================
+
 
 _SANITIZER_ERROR_PATTERN = re.compile(
     r"(?:AddressSanitizer|UndefinedBehaviorSanitizer|LeakSanitizer|ERROR:\s*(?:address|leak|undefined))",
     re.IGNORECASE,
 )
 
-_CRASH_STDERR_PATTERN = re.compile(
-    r"segmentation fault|access violation|illegal instruction|floating point exception|aborted|stack overflow",
-    re.IGNORECASE,
+_SANITIZER_STDERR_PATTERN = re.compile(
+    r"^(==\d+==|SUMMARY:|ASAN_OPTIONS|UBSAN_OPTIONS|\s*#\d+|Direct leak|Indirect leak)",
+    re.MULTILINE,
 )
-
-_VERIFIED_COMPILERS: set[str] = set()
-
-
-def _sanitizers_available() -> bool:
-    """Return False on Windows/MinGW where ASan/UBSan libs are typically missing."""
-    return platform.system() != "Windows"
 
 
 def _detect_sanitizer_errors(stderr_text: str) -> list[str]:
-    """Return a list of sanitizer diagnostic lines found in stderr output."""
+    """
+    Extract sanitizer diagnostic lines from stderr.
+    
+    Args:
+        stderr_text: Captured stderr output.
+    
+    Returns:
+        List of sanitizer error lines; empty if none found.
+    """
     if not stderr_text:
         return []
     findings: list[str] = []
@@ -48,25 +386,19 @@ def _detect_sanitizer_errors(stderr_text: str) -> list[str]:
     return findings
 
 
-def _parse_peak_memory_kb(stderr_text: str) -> int | None:
-    """Extract peak resident-set size (KB) from ASan or /usr/bin/time output.
-
-    On Windows this commonly returns None because /usr/bin/time -v is unavailable.
+def _filter_sanitizer_lines(text: str) -> str:
     """
-    if not stderr_text:
-        return None
-
-    # GNU time -v format.
-    match = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr_text)
-    if match:
-        return int(match.group(1))
-
-    # ASan stats (bytes allocated -> convert to KB).
-    match = re.search(r"(\d+)\s+byte\(s\)\s+allocated", stderr_text)
-    if match:
-        return max(1, int(match.group(1)) // 1024)
-
-    return None
+    Remove sanitizer output lines from text while preserving program output.
+    
+    Args:
+        text: Text potentially containing sanitizer diagnostics.
+    
+    Returns:
+        Text with sanitizer lines removed.
+    """
+    lines = text.splitlines()
+    filtered = [line for line in lines if not _SANITIZER_STDERR_PATTERN.match(line)]
+    return "\n".join(filtered)
 
 
 def resolve_cpp_compiler(explicit_path: str | None = None) -> str:
@@ -90,6 +422,28 @@ def resolve_cpp_compiler(explicit_path: str | None = None) -> str:
             return found
 
     return "g++"
+
+
+def _sanitizers_available() -> bool:
+    """
+    Check if sanitizers (ASan/UBSan) are available on this platform.
+    
+    Returns True if /usr/bin/time is available (indicates Unix-like system with
+    sanitizer support) or if psutil module is available (for cross-platform support).
+    
+    Returns:
+        True if sanitizers are likely available, False otherwise.
+    """
+    # On Unix systems, we assume sanitizers are available if we have the time command
+    if platform.system() != "Windows" and os.path.isfile("/usr/bin/time"):
+        return True
+    
+    # If psutil is available, we have better memory tracking on any platform
+    if HAS_PSUTIL:
+        return True
+    
+    # Default: assume unavailable on Windows or if tools are missing
+    return False
 
 
 def _verify_compiler(compiler_path: str, timeout_seconds: int = 5) -> None:
@@ -122,7 +476,7 @@ def _build_compile_command(
     exe_path: str,
     enable_sanitizers: bool,
 ) -> list[str]:
-    cmd = [compiler_path, "-std=c++23", "-Wall"]
+    cmd = [compiler_path, "-std=c++17", "-Wall"]
     if enable_sanitizers:
         cmd.extend(_SANITIZER_COMPILE_FLAGS)
     cmd.extend([source_path, "-o", exe_path])
@@ -196,27 +550,6 @@ def _compile_to_exe(
     }
 
 
-def _detect_crash_reason(exit_code: int | None, stderr_text: str, timed_out: bool) -> str:
-    """Infer crash reason in a platform-tolerant way from stderr and exit code."""
-    if timed_out:
-        return "timeout"
-
-    if _CRASH_STDERR_PATTERN.search(stderr_text or ""):
-        return "Process crashed (detected from stderr)."
-
-    if exit_code is None:
-        return "execution_error"
-
-    # Negative return codes usually mean signal termination on Unix-like systems.
-    if exit_code < 0:
-        return f"Process terminated by signal {-exit_code} (platform-dependent)."
-
-    if exit_code != 0:
-        return f"Process exited with non-zero status {exit_code}."
-
-    return ""
-
-
 def _run_exe(
     exe_path: str,
     input_data: str | None,
@@ -273,7 +606,7 @@ def _run_exe(
 
     crash_reason = _detect_crash_reason(exit_code, stderr_text, timed_out)
     sanitizer_findings = _detect_sanitizer_errors(stderr_text)
-    peak_memory_kb = _parse_peak_memory_kb(stderr_text)
+    peak_memory_kb = _get_peak_memory_kb(stderr_text)
 
     return {
         "compile_success": True,

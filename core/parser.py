@@ -252,10 +252,22 @@ class CppParser:
         }
 
     @staticmethod
-    def _compute_signature_hash(parameters: List[Dict[str, Any]]) -> str:
-        """Return a short deterministic hash of function parameter types."""
+    def _compute_signature_hash(parameters: List[Dict[str, Any]], signature_text: str = "") -> str:
+        """Return a stable hash for declarative function identity.
+
+        The hash is derived from a normalized declaration signature (when
+        available) so formatting changes do not perturb FQN identity.
+        """
+        if signature_text:
+            normalized = re.sub(r"/\*.*?\*/", " ", signature_text, flags=re.DOTALL)
+            normalized = re.sub(r"//[^\n]*", " ", normalized)
+            normalized = re.sub(r"\s+", " ", normalized).strip()
+            if normalized:
+                return hashlib.md5(normalized.encode("utf-8")).hexdigest()[:8]
+
         type_str = ",".join(str(p.get("type") or "") for p in parameters)
-        return hashlib.md5(type_str.encode("utf-8")).hexdigest()[:8]
+        normalized_types = re.sub(r"\s+", " ", type_str).strip()
+        return hashlib.md5(normalized_types.encode("utf-8")).hexdigest()[:8]
 
     def _process_ast_node(
         self,
@@ -628,7 +640,7 @@ class CppParser:
         calls = self._collect_function_calls(node, source_bytes)
         modifiers = self._extract_modifiers(signature_text)
         parameters = self._extract_structured_parameters(node, source_bytes)
-        signature_hash = self._compute_signature_hash(parameters)
+        signature_hash = self._compute_signature_hash(parameters, signature_text=signature_text)
         unique_fqn = f"{fqn}#{signature_hash}" if fqn else f"{function_name}#{signature_hash}"
         lower_signature = signature_text.lower()
         lower_body = body_text.lower()

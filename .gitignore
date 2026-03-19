@@ -187,3 +187,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime/cache artifacts
+.openai_cache.json
+token_usage.json
+modernization_report.txt
+dependency_graph.dot

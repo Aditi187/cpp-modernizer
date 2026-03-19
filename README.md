@@ -1,101 +1,90 @@
 # Air-Gapped Codebase Modernization Engine
 
-A tool for analyzing and modernizing C++ codebases with a LangGraph-powered multi-agent workflow and local LLM inference through Ollama.
-
-## Overview
-
-This engine parses legacy C++ source files, builds a dependency graph, and runs a three-node LangGraph workflow — **Analyzer → Modernizer → Verifier** — to automatically suggest and verify modernized code. Source analysis, compilation, and model inference all run locally using Ollama.
-
-## Features
-
-- **C++ Parsing** — Extracts functions and structure from `.cpp` files using `tree-sitter`.
-- **Dependency Graph** — Builds a call graph to determine safe modernization order.
-- **LangGraph Workflow** — Multi-step agent pipeline with an Analyzer, Modernizer, and Verifier node (with feedback loop).
-- **Differential Testing** — Compiles and compares original vs. modernized code to catch regressions.
-- **MCP Tool Server** — Exposes project tools via a [FastMCP](https://github.com/jlowin/fastmcp) server for agent use.
-- **Local Model Support** — Uses Ollama with a local code model (default: `deepseek-coder:6.7b`) to avoid API quotas and rate limits.
-- **Observability (LangFuse)** — Captures modernization traces, tool spans, Gemini generations, and token usage/cost-related metadata.
+Modernizes legacy C++ code using a LangGraph workflow with an OpenAI-backed LLM and deterministic fallback.
 
 ## Project Structure
 
+```text
+agents/   # Workflow orchestration and modernization agents
+core/     # Parser, graph, LLM bridge, tester, and modernization engines
+tools/    # MCP server and integration tools
+tests/    # Unit and integration tests
+docs/     # Refactoring and technical documentation
+cache/    # Runtime cache data (not required for source control)
 ```
-├── agents/
-│   └── workflow.py          # LangGraph workflow (Analyzer → Modernizer → Verifier)
-├── core/
-│   ├── parser.py            # C++ source parser (tree-sitter)
-│   ├── graph.py             # Dependency graph & modernization ordering
-│   ├── differential_tester.py  # Compile & diff-test original vs. modernized code
-│   ├── local_ollama_bridge.py # Local Ollama client + LangFuse tracing bridge
-│   └── inspect_parser.py    # Parser inspection utilities
-├── tools/
-│   └── mcp_server.py        # FastMCP tool server
-├── requirements.txt
-├── pyproject.toml
-└── test.cpp                 # Sample C++ file for testing
-```
+
+## Overview
+
+The engine parses C++ source, builds dependency order, modernizes function-by-function, compiles, and verifies behavior. The workflow path is Analyzer -> Modernizer -> Verifier (and tester routing), with automatic no-LLM fallback when provider health or quota is unavailable.
+
+## Features
+
+- C++ parsing with tree-sitter.
+- Dependency-aware modernization ordering.
+- OpenAI provider bridge for model calls.
+- Deterministic rule-based fallback when LLM is unavailable.
+- Differential compile/run parity checks.
+- LangFuse trace and generation observability.
+- MCP server for tool-based integration.
 
 ## Requirements
 
-- **Python 3.12 or 3.13** (Python 3.14 triggers Pydantic V1 compatibility warnings in `langchain-core`; use 3.12/3.13 for a clean run)
-- [Ollama](https://ollama.com) installed and running locally
-- A local model pulled (default: `deepseek-coder:6.7b`)
-- A C++ compiler (`g++` / `clang++`) available on `PATH`
+- Python 3.12 or 3.13.
+- C++ compiler on PATH (g++ or clang++).
+- OpenAI API key.
 
 ## Installation
 
 ```bash
-# Clone the repository
-git clone <https://github.com/Aditi187/Air-Gapped-Codebase-Modernization-Engine/tree/main>
-cd air-gapped-codebase-modernization-engine
-
-# Create and activate a virtual environment (use Python 3.12 or 3.13)
 py -3.12 -m venv .venv
-.venv\Scripts\activate        # Windows
-# source .venv/bin/activate   # macOS / Linux
-
-# Install all dependencies (networkx and python-dotenv are now included)
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Usage
+## Environment
 
-1. Configure Ollama:
-
-```bash
-# Required local runtime
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=deepseek-coder:6.7b
-OLLAMA_TIMEOUT_SECONDS=300
-
-# LangFuse observability
-LANGFUSE_PUBLIC_KEY=pk-lf-...
-LANGFUSE_SECRET_KEY=sk-lf-...
-LANGFUSE_HOST=https://cloud.langfuse.com
-```
-
-Pull the model once before running:
+Configure [.env](.env) with OpenAI settings.
 
 ```bash
-ollama pull deepseek-coder:6.7b
+WORKFLOW_MODEL_PROVIDER=openai
+API_KEY=...
+OPENAI_MODELS=gpt-5.3-codex-xhigh
+OPENAI_ENABLE_CACHE=1
+OPENAI_MAX_CALLS_PER_MINUTE=35
+OPENAI_INTER_REQUEST_DELAY_SECONDS=1.5
+OPENAI_429_BASE_DELAY_SECONDS=60
+OPENAI_429_MAX_DELAY_SECONDS=900
+WORKFLOW_BATCH_SIZE=3
 ```
-2. Run the modernization workflow against a C++ file:
+
+## Run Workflow
 
 ```bash
 python agents/workflow.py
 ```
 
-3. To start the MCP tool server:
+Default sample input is [test.cpp](test.cpp), and output is written to [test_modernized.cpp](test_modernized.cpp).
+
+## Run MCP Server
 
 ```bash
 python tools/mcp_server.py
 ```
 
-## LangFuse Expectations
+## Notes
 
-- Each modernization run creates a trace named `CPP-Modernization`.
-- The `get_context_for_function` and `run_compiler` MCP tools are captured as spans.
-- Ollama calls are captured as generations with `model` metadata.
-- If `run_compiler` returns an error status, the trace is marked as `Error`.
+- If OpenAI health fails (for example quota/rate-limit), the workflow can continue in deterministic fallback mode.
+- LangFuse is optional but enabled when LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST are set.
+
+## Git Hygiene
+
+- Runtime artifacts are ignored (for example cache snapshots, token usage, generated reports, and logs).
+- Keep only source, tests, and docs in commits.
+- Before push, run:
+
+```bash
+pytest -q
+```
 
 ## License
 

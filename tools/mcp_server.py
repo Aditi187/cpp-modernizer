@@ -5,14 +5,19 @@ import re
 import glob
 import json
 import sys
+import hashlib
 from pathlib import Path
-# Force UTF-8 output on Windows to prevent UnicodeEncodeError with emoji characters.
-stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
-if callable(stdout_reconfigure):
-    stdout_reconfigure(encoding="utf-8", errors="replace")
-stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
-if callable(stderr_reconfigure):
-    stderr_reconfigure(encoding="utf-8", errors="replace")
+# Prefer non-destructive stream hardening: keep terminal encoding and only
+# switch to replacement mode when UTF support is missing.
+def _configure_stream_encoding(stream: object) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    encoding = str(getattr(stream, "encoding", "") or "").lower()
+    if callable(reconfigure) and "utf" not in encoding:
+        reconfigure(errors="replace")
+
+
+_configure_stream_encoding(sys.stdout)
+_configure_stream_encoding(sys.stderr)
 
 import threading
 import time
@@ -34,10 +39,8 @@ load_dotenv(
 from core.logger import get_logger
 logger = get_logger(__name__)
 
-from core.gemini_bridge import (
-    CPP_MODERNIZATION_SYSTEM_PROMPT,
-    GeminiBridge,
-)
+from core.openai_bridge import CPP_MODERNIZATION_SYSTEM_PROMPT, OpenAIBridge
+from core.rag import get_global_rag
 
 try:
     from core.parser import CppParser
@@ -90,13 +93,64 @@ if _ALLOW_RISKY_BUILD_TOOLS:
     _ALLOWED_COMPILERS.update({"make", "cmake", "ninja"})
 
 _MODEL_SYSTEM_PROMPT = CPP_MODERNIZATION_SYSTEM_PROMPT
-_MODEL_BRIDGE = GeminiBridge.from_env(
+_MODEL_BRIDGE = OpenAIBridge.from_env(
     log_fn=logger.info
 )
+_ENABLE_RAG = os.environ.get("ENABLE_RAG", "0").strip().lower() in {"1", "true", "yes", "on"}
+_RAG = get_global_rag(enabled=_ENABLE_RAG)
+
+
+def _index_project_map_in_rag(project_map: dict[str, object], source: str) -> None:
+    if _RAG is None:
+        return
+    functions = project_map.get("functions") if isinstance(project_map, dict) else None
+    if not isinstance(functions, dict):
+        return
+    for fqn, meta in functions.items():
+        if not isinstance(meta, dict):
+            continue
+        code = str(meta.get("body") or "").strip()
+        if not code:
+            continue
+        _RAG.add_document(
+            code=code,
+            metadata={
+                "source": source,
+                "fqn": str(fqn),
+                "name": str(meta.get("name") or ""),
+            },
+        )
+
+
+def _mcp_warmup() -> None:
+    """Perform mandatory startup warmup for parser cache and model bridge."""
+    logger.info(
+        "MCP config: allow_run_binary=%s, allow_risky_build_tools=%s, compiler_timeout=%ss, cache_max_types=%s",
+        _ALLOW_RUN_BINARY,
+        _ALLOW_RISKY_BUILD_TOOLS,
+        _RUN_COMPILER_TIMEOUT_SECONDS,
+        _GLOBAL_CACHE_MAX_TYPES,
+    )
+    _GlobalProjectMapCache.get().build_in_background()
+    if _PARSER_AVAILABLE:
+        try:
+            CppParser().parse_string("int __mcp_warmup__() { return 0; }")
+            logger.info("MCP warmup: parser ready.")
+        except Exception as exc:
+            logger.warning("MCP warmup: parser preflight failed: %r", exc)
+
+    try:
+        is_healthy, message = _MODEL_BRIDGE.check_health()
+        if is_healthy:
+            logger.info("MCP warmup: model provider healthy (%s)", message)
+        else:
+            logger.warning("MCP warmup: model provider not healthy (%s)", message)
+    except Exception as exc:
+        logger.warning("MCP warmup: model health check failed: %r", exc)
 
 
 def call_model(system_prompt: str, user_prompt: str) -> str:
-    """Call Gemini with shared retry and full-response safeguards."""
+    """Call the configured model with shared retry and full-response safeguards."""
     return _MODEL_BRIDGE.chat_completion(
         system_prompt,
         user_prompt,
@@ -453,13 +507,26 @@ def write_code(file_path: str, content: str) -> str:
                 existing_content = _fh.read()
             existing_len = len(existing_content)
             incoming_len = len(content)
-            if existing_len > 0 and incoming_len < existing_len * 0.5:
+            existing_lines = max(1, existing_content.count("\n") + 1)
+            incoming_lines = max(1, content.count("\n") + 1)
+            has_truncation_marker = bool(
+                re.search(r"\.{3}|<\s*truncated\s*>|\[\s*snip\s*\]", content[-400:], re.IGNORECASE)
+            )
+            looks_suspiciously_short = (
+                existing_len > 0
+                and incoming_len < existing_len * 0.5
+                and incoming_lines < existing_lines * 0.6
+            )
+            if has_truncation_marker or looks_suspiciously_short:
                 pct = incoming_len * 100 // existing_len
                 return _make_result(
-                    "warning",
+                    "error",
                     message="ERROR: Potential truncation detected. Please provide the full file content.",
                     existing_chars=existing_len,
                     incoming_chars=incoming_len,
+                    existing_lines=existing_lines,
+                    incoming_lines=incoming_lines,
+                    truncation_marker_detected=has_truncation_marker,
                     truncation_percent=pct,
                 )
         except UnicodeDecodeError:
@@ -475,7 +542,7 @@ def write_code(file_path: str, content: str) -> str:
     try:
         with open(absolute_path, "w", encoding="utf-8") as fh:
             fh.write(content)
-        _GlobalProjectMapCache.get().invalidate()
+        _GlobalProjectMapCache.get().invalidate_file(absolute_path, reparse_now=True)
         return _make_result(
             "success",
             message=f"Wrote {len(content)} characters to {absolute_path}",
@@ -1252,10 +1319,13 @@ class _GlobalProjectMapCache:
         self._type_definitions: dict[str, str] = {}
         self._types_meta: list[dict] = []
         self._file_mtimes: dict[str, float] = {}
+        self._file_last_access: dict[str, float] = {}
+        self._stale_files: set[str] = set()
         self._type_to_file: dict[str, str] = {}
         self._include_graph: dict[str, list[str]] = {}
         self._built: bool = False
         self._building: bool = False
+        self._build_thread: threading.Thread | None = None
         self._data_lock = threading.RLock()
         self._build_event = threading.Event()
 
@@ -1269,15 +1339,21 @@ class _GlobalProjectMapCache:
     # --- Incremental helpers ------------------------------------------------
 
     def _should_reindex_file(self, filepath: str) -> bool:
+        if filepath in self._stale_files:
+            return True
         try:
             current_mtime = os.path.getmtime(filepath)
         except OSError:
             return False
         return self._file_mtimes.get(filepath) != current_mtime
 
+    def _touch_file_access(self, filepath: str) -> None:
+        self._file_last_access[filepath] = time.time()
+
     def _index_file(self, parser: "CppParser", filepath: str) -> None:
         try:
             pm = parser.parse_file(filepath, workspace_root=ALLOWED_ROOT)
+            _index_project_map_in_rag(pm, source=filepath)
         except Exception:
             return
 
@@ -1286,15 +1362,18 @@ class _GlobalProjectMapCache:
                 self._file_mtimes[filepath] = os.path.getmtime(filepath)
             except OSError:
                 pass
+            self._touch_file_access(filepath)
+            self._stale_files.discard(filepath)
 
             # Evict stale entries belonging to this file.
             stale_names = [n for n, f in self._type_to_file.items() if f == filepath]
+            stale_name_set = set(stale_names)
             for n in stale_names:
                 self._type_definitions.pop(n, None)
                 self._type_to_file.pop(n, None)
             self._types_meta = [
                 t for t in self._types_meta
-                if self._type_to_file.get(str(t.get("name", ""))) != filepath
+                if str(t.get("name", "")) not in stale_name_set
             ]
 
             # Insert fresh data.
@@ -1315,20 +1394,23 @@ class _GlobalProjectMapCache:
         if current_size <= _GLOBAL_CACHE_MAX_TYPES:
             return
 
-        # Keep most recently seen files based on mtime and evict oldest first.
-        by_age = sorted(self._file_mtimes.items(), key=lambda item: item[1])
+        # Evict least-recently-used files first based on access time.
+        by_age = sorted(self._file_last_access.items(), key=lambda item: item[1])
         while len(self._type_definitions) > _GLOBAL_CACHE_MAX_TYPES and by_age:
             stale_file, _mtime = by_age.pop(0)
             stale_names = [n for n, f in self._type_to_file.items() if f == stale_file]
+            stale_name_set = set(stale_names)
             for name in stale_names:
                 self._type_definitions.pop(name, None)
                 self._type_to_file.pop(name, None)
             self._types_meta = [
                 t for t in self._types_meta
-                if self._type_to_file.get(str(t.get("name", ""))) != stale_file
+                if str(t.get("name", "")) not in stale_name_set
             ]
             self._include_graph.pop(stale_file, None)
             self._file_mtimes.pop(stale_file, None)
+            self._file_last_access.pop(stale_file, None)
+            self._stale_files.discard(stale_file)
 
     # --- Build methods ------------------------------------------------------
 
@@ -1363,15 +1445,18 @@ class _GlobalProjectMapCache:
                 missing_files = [p for p in self._file_mtimes if not os.path.exists(p)]
                 for stale_file in missing_files:
                     stale_names = [n for n, f in self._type_to_file.items() if f == stale_file]
+                    stale_name_set = set(stale_names)
                     for name in stale_names:
                         self._type_definitions.pop(name, None)
                         self._type_to_file.pop(name, None)
                     self._types_meta = [
                         t for t in self._types_meta
-                        if self._type_to_file.get(str(t.get("name", ""))) != stale_file
+                        if str(t.get("name", "")) not in stale_name_set
                     ]
                     self._include_graph.pop(stale_file, None)
                     self._file_mtimes.pop(stale_file, None)
+                    self._file_last_access.pop(stale_file, None)
+                    self._stale_files.discard(stale_file)
                 self._built = True
         finally:
             with self._data_lock:
@@ -1382,10 +1467,14 @@ class _GlobalProjectMapCache:
         """Launch a daemon thread that builds the cache without blocking."""
         with self._data_lock:
             if self._building:
+                if self._build_thread is not None:
+                    return self._build_thread
                 thread = threading.Thread(target=lambda: None, daemon=True)
                 thread.start()
                 return thread
         thread = threading.Thread(target=self._build, daemon=True)
+        with self._data_lock:
+            self._build_thread = thread
         thread.start()
         return thread
 
@@ -1393,10 +1482,18 @@ class _GlobalProjectMapCache:
         with self._data_lock:
             already_built = self._built
             is_building = self._building
+            active_thread = self._build_thread
         if already_built:
             return
         if is_building:
             self._build_event.wait(timeout=10)
+            with self._data_lock:
+                if self._built:
+                    return
+            logger.warning("Global type cache build exceeded warmup timeout; falling back to synchronous build.")
+            if active_thread is not None and active_thread.is_alive():
+                active_thread.join(timeout=1)
+            self._build()
             return
         self._build()
 
@@ -1418,6 +1515,13 @@ class _GlobalProjectMapCache:
                 t for t in self._types_meta
                 if str(t.get("name", "")) in name_set
             ]
+            touched_files = {
+                self._type_to_file.get(name, "")
+                for name in matched_defs.keys()
+            }
+            for f in touched_files:
+                if f:
+                    self._touch_file_access(f)
         return matched_defs, matched_meta
 
     def get_header_path(self, type_name: str) -> str:
@@ -1425,6 +1529,8 @@ class _GlobalProjectMapCache:
         self.ensure_built()
         with self._data_lock:
             filepath = self._type_to_file.get(type_name, "")
+            if filepath:
+                self._touch_file_access(filepath)
         if filepath:
             return os.path.relpath(filepath, ALLOWED_ROOT)
         return ""
@@ -1434,6 +1540,8 @@ class _GlobalProjectMapCache:
         self.ensure_built()
         with self._data_lock:
             raw_headers = list(self._include_graph.get(filepath, []))
+            if filepath in self._include_graph:
+                self._touch_file_access(filepath)
         result: dict[str, str | None] = {}
         file_dir = os.path.dirname(filepath)
         for hdr in raw_headers:
@@ -1468,11 +1576,28 @@ class _GlobalProjectMapCache:
             self._type_definitions.clear()
             self._types_meta.clear()
             self._file_mtimes.clear()
+            self._file_last_access.clear()
+            self._stale_files.clear()
             self._type_to_file.clear()
             self._include_graph.clear()
             self._built = False
             self._building = False
+            self._build_thread = None
             self._build_event.clear()
+
+    def invalidate_file(self, filepath: str, reparse_now: bool = False) -> None:
+        """Mark one file stale and optionally re-index it immediately."""
+        with self._data_lock:
+            self._stale_files.add(filepath)
+            self._built = False
+        if reparse_now and _PARSER_AVAILABLE and os.path.isfile(filepath):
+            try:
+                parser = CppParser()
+                self._index_file(parser, filepath)
+                with self._data_lock:
+                    self._built = True
+            except Exception as exc:
+                logger.warning("Cache reparse failed for '%s': %r", filepath, exc)
 
 
 # ===================================================================
@@ -1529,6 +1654,9 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
+    # Keep cache freshness for this file deterministic after recent writes.
+    _GlobalProjectMapCache.get().invalidate_file(absolute_path, reparse_now=True)
+
     source_text = _read_text_if_exists(absolute_path)
     if span is not None:
         _MODEL_BRIDGE.end_span(
@@ -1552,6 +1680,7 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
     try:
         parser = CppParser()
         project_map = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
+        _index_project_map_in_rag(project_map, source=absolute_path)
     except Exception as exc:
         result = _make_result("error", message=f"Failed to parse C++ file: {exc!r}")
         _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
@@ -1593,6 +1722,18 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         return result
     signature = str(fn_meta.get("signature") or "")
     body = str(base_context.get("body") or "")
+    if not body.strip():
+        available = sorted(functions.keys()) if isinstance(functions, dict) else []
+        result = _make_result(
+            "error",
+            message=(
+                f"Context extraction returned empty body for '{function_fqn}'. "
+                "This can happen after partial edits that the parser cannot recover from."
+            ),
+            available_fqns=available,
+        )
+        _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
+        return result
     called_signatures: dict = base_context.get("called_function_signatures") or {}
 
     # Collect seed type names from parameters + signature + body.
@@ -1660,6 +1801,15 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         "header_paths": header_paths,
         "required_headers": include_reqs,
     }
+    logger.debug(
+        "Context bundle built: fqn=%s resolved_fqn=%s body_hash=%s types=%d called=%d headers=%d",
+        function_fqn,
+        resolved_fqn,
+        hashlib.sha256(body.encode("utf-8")).hexdigest()[:12],
+        len(type_bundle),
+        len(called_signatures),
+        len(include_reqs),
+    )
     _MODEL_BRIDGE.end_span(
         span,
         output_payload=result_obj,
@@ -1702,6 +1852,7 @@ def get_include_graph(file_path: str) -> str:
         try:
             parser = CppParser()
             pm = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
+            _index_project_map_in_rag(pm, source=absolute_path)
             headers = pm.get("headers") or []
             file_dir = os.path.dirname(absolute_path)
             graph = {}
@@ -1721,7 +1872,7 @@ def get_include_graph(file_path: str) -> str:
 
 
 @mcp_server.tool()
-def add_header_to_file(file_path: str, header_name: str) -> str:
+def add_header_to_file(file_path: str, header_name: str, force: bool = False) -> str:
     """Add an ``#include`` directive to a C++ file if not already present.
 
     The header is inserted immediately after the last existing ``#include``
@@ -1764,13 +1915,29 @@ def add_header_to_file(file_path: str, header_name: str) -> str:
         global_cache = _GlobalProjectMapCache.get()
         resolved = global_cache._resolve_header(header_name, os.path.dirname(absolute_path))
         if resolved is None:
+            if not force:
+                return _make_result(
+                    "error",
+                    message=(
+                        f"Header {header_name} could not be resolved inside the workspace. "
+                        "Set force=true to add it anyway."
+                    ),
+                )
             resolution_warning = (
                 f"Header {header_name} could not be resolved inside the workspace. "
-                "Include was still added."
+                "Include added because force=true."
             )
     except Exception:
+        if not force:
+            return _make_result(
+                "error",
+                message=(
+                    f"Header {header_name} resolution check failed. "
+                    "Set force=true to add it anyway."
+                ),
+            )
         resolution_warning = (
-            f"Header {header_name} resolution check failed. Include was still added."
+            f"Header {header_name} resolution check failed. Include added because force=true."
         )
 
     last_include_idx = -1
@@ -1905,7 +2072,7 @@ def get_compilation_errors(
 
 
 if __name__ == "__main__":
-    _GlobalProjectMapCache.get().build_in_background()
+    _mcp_warmup()
     mcp_server.run()
 
 
