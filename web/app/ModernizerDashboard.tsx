@@ -19,8 +19,9 @@ export default function ModernizerDashboard() {
     addLog('Initiating modernization sequence...');
 
     try {
-      const response = await fetch('https://cpp-modernizer.vercel.app/modernize', {
+      const response = await fetch('https://cpp-modernizer.vercel.app/api/modernize', {
         method: 'POST',
+
         headers: {
           'Content-Type': 'application/json',
         },
