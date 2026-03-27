@@ -12,11 +12,23 @@ if str(project_root) not in sys.path:
 
 from agents.workflow.orchestrator import run_modernization_workflow
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(
     title="Air-Gapped C++ Modernization Engine API",
     description="API for transforming legacy C++ into modern C++17.",
     version="0.1.0"
 )
+
+# Enable CORS for frontend communication
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 class ModernizationRequest(BaseModel):
     code: str
