@@ -4,7 +4,9 @@ Modernizes legacy C/C++ code into idiomatic C++17 using a modular, high-stabilit
 
 ## Project Overview
 
-The engine utilizes a state-graph architecture to transform legacy C++ into modern C++17. The pipeline follows a structured "Phase 4" flow: **Analyze → Plan → Modernize → Semantic Guard → Verify → Fix**.
+The engine utilizes a state-graph architecture to transform legacy C++ into modern C++17. The pipeline follows a structured "Phase 4" flow:
+
+**Analyzer → Planner → Rule Engine → LLM → Guard → Compiler → Fixer**
 
 ### Multi-Model LLM Strategy
 The engine is optimized for the NVIDIA API gateway, routing specialized agents to advanced models:

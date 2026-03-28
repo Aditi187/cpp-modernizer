@@ -47,6 +47,7 @@ def analyzer_node(state: ModernizationState) -> ModernizationState:
     if "FILE*" in code: findings.append("C-style FILE* API usage")
     if "#define" in code: findings.append("Preprocessor macro usage")
     if "typedef" in code: findings.append("typedef detected")
+    if "time_t" in code or "localtime" in code: findings.append("legacy C-style time API usage")
 
     # 3. Target mapping (Strategic)
     targets = []

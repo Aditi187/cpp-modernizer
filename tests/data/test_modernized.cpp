@@ -3,89 +3,88 @@
 #include <vector>
 #include <string>
 #include <memory>
-#include <ctime>
-#include <cstring>
+#include <chrono>
+#include <mutex>
 
-constexpr auto MAX_SIZE = 100;
+constexpr auto MAX_USERS = 10;
+constexpr auto BUFFER_SIZE = 256;
 
-using Node = struct Node {
+inline constexpr int multiply(int a, int b) {
+    return a * b;
+}
+
+struct User {
     int id;
     std::string name;
-    std::unique_ptr<Node> next;
+    std::unique_ptr<User> next;
 };
 
-using Logger = struct Logger {
-    mutable std::ofstream file;
+struct Logger {
+    std::ofstream file;
+    mutable std::mutex mutex;
     std::string buffer;
 };
 
-void init_logger(Logger& logger, const std::string_view filename) {
-    logger.file.open(filename.data(), std::ios_base::app);
-    logger.buffer = "LOG START\n";
+void init_logger(Logger& logger, const std::string& filename) {
+    logger.file.open(filename, std::ios_base::app);
+    logger.buffer = "LOGGER INITIALIZED\n";
     logger.file << logger.buffer;
 }
 
-void log_message(const Logger& logger, const std::string_view message) {
-    if (logger.file.is_open()) {
-        std::time_t rawtime;
-        std::time(&rawtime);
-#ifdef _WIN32
-        std::tm timeinfo;
-        localtime_s(&timeinfo, &rawtime);
-#else
-        std::tm* timeinfo = std::localtime(&rawtime);
-#endif
-        logger.file << "[" << timeinfo.tm_hour << ":" << timeinfo.tm_min << ":" << timeinfo.tm_sec << "] " << message << "\n";
-        logger.file.flush();
-    }
+void log_message(Logger& logger, const std::string& msg) {
+    if (!logger.file.is_open()) return;
+    auto now = std::chrono::system_clock::now();
+    auto now_time = std::chrono::system_clock::to_time_t(now);
+    auto now_tm = *std::localtime(&now_time);
+    std::lock_guard<std::mutex> lock(logger.mutex);
+    logger.file << "[" << now_tm.tm_hour << ":" << now_tm.tm_min << ":" << now_tm.tm_sec << "] " << msg << "\n";
+    logger.file.flush();
 }
 
 void close_logger(Logger& logger) {
-    if (logger.file.is_open()) {
-        logger.file.close();
+    logger.file.close();
+}
+
+std::unique_ptr<User> create_user(int id, const std::string& name) {
+    auto u = std::make_unique<User>();
+    u->id = id;
+    u->name = name;
+    return u;
+}
+
+void append_user(User& head, int id, const std::string& name) {
+    auto temp = &head;
+    while (temp->next) {
+        temp = temp->next.get();
     }
+    temp->next = create_user(id, name);
 }
 
-std::unique_ptr<Node> create_node(int id, const std::string_view name) {
-    auto node = std::make_unique<Node>();
-    node->id = id;
-    node->name = name;
-    return node;
-}
-
-void append_node(std::unique_ptr<Node>& head, int id, const std::string_view name) {
-    if (!head) {
-        head = create_node(id, name);
-    } else {
-        auto temp = head.get();
-        while (temp->next) {
-            temp = temp->next.get();
-        }
-        temp->next = create_node(id, name);
-    }
-}
-
-void print_list(const std::unique_ptr<Node>& head) {
-    auto temp = head.get();
+void print_users(const User& head) {
+    const auto* temp = &head;
     while (temp) {
-        std::cout << "ID: " << temp->id << " Name: " << temp->name << "\n";
+        std::cout << "USER " << temp->id << " : " << temp->name << "\n";
         temp = temp->next.get();
     }
 }
 
 void legacy_string_ops() {
-    std::string buffer = "Legacy string example";
-    int len = buffer.length();
-    std::cout << "String length = " << len << "\n";
+    std::string buffer = "legacy_string";
+    buffer += "_suffix";
+    std::cout << "buffer=" << buffer << " length=" << buffer.length() << "\n";
 }
 
-void legacy_array_ops() {
-    std::vector<int> numbers(5);
-    for (int i = 0; i < 5; i++) {
-        numbers[i] = i * 10;
+std::vector<int> create_array(int n) {
+    std::vector<int> arr(n);
+    for (int i = 0; i < n; i++) {
+        arr[i] = multiply(i, 2);
     }
-    for (int i = 0; i < 5; i++) {
-        std::cout << numbers[i] << " ";
+    return arr;
+}
+
+void print_array(const std::vector<int>& arr) {
+    for (const auto& value : arr) {
+        std::cout << value << " ";
     }
     std::cout << "\n";
 }
@@ -102,36 +101,67 @@ void legacy_file_read() {
     }
 }
 
-class LegacyClass {
+class LegacyBuffer {
 public:
-    std::vector<int> values;
-    LegacyClass() {
-        values.resize(3);
-        for (int i = 0; i < 3; i++) {
-            values[i] = i * 2;
-        }
-    }
+    LegacyBuffer(int s) : data("class_buffer") {}
     void print() const {
-        for (int i = 0; i < 3; i++) {
-            std::cout << values[i] << "\n";
+        std::cout << "buffer=" << data << "\n";
+    }
+private:
+    std::string data;
+};
+
+class LegacyIntArray {
+public:
+    LegacyIntArray(int n) : values(n) {
+        for (int i = 0; i < n; i++) {
+            values[i] = i * 3;
         }
     }
+    void show() const {
+        for (const auto& value : values) {
+            std::cout << value << "\n";
+        }
+    }
+private:
+    std::vector<int> values;
 };
+
+void manual_copy(std::string& dst, const std::string& src) {
+    dst = src;
+}
+
+void unsafe_concat() {
+    std::string a = "unsafe";
+    a += "concat";
+    std::cout << a << "\n";
+}
+
+void mixed_operations() {
+    auto numbers = create_array(5);
+    print_array(numbers);
+}
 
 int main() {
     Logger logger;
     init_logger(logger, "app.log");
-    log_message(logger, "Program started");
-    std::unique_ptr<Node> head = create_node(1, "Alice");
-    append_node(head, 2, "Bob");
-    append_node(head, 3, "Charlie");
-    print_list(head);
+    log_message(logger, "PROGRAM START");
+    auto head = create_user(1, "Alice");
+    append_user(*head, 2, "Bob");
+    append_user(*head, 3, "Charlie");
+    print_users(*head);
     legacy_string_ops();
-    legacy_array_ops();
     legacy_file_read();
-    LegacyClass obj;
-    obj.print();
-    log_message(logger, "Program finished");
+    mixed_operations();
+    LegacyBuffer buffer(50);
+    buffer.print();
+    LegacyIntArray arr(5);
+    arr.show();
+    unsafe_concat();
+    std::string temp;
+    manual_copy(temp, "manual_copy_test");
+    std::cout << temp << "\n";
+    log_message(logger, "PROGRAM END");
     close_logger(logger);
     return 0;
 }

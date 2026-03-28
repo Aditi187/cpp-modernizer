@@ -112,6 +112,26 @@ _RULES: List[ModernizationRule] = [
         ast_triggers=("free_usage",),
         hint_only=True,
     ),
+    ModernizationRule(
+        pattern=r"\btime_t\b|\blocaltime\b",
+        replacement=r"\g<0>",
+        description="legacy time API - migrate to std::chrono",
+        ast_triggers=("time_usage",),
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"^\s*#\s*define\s+([a-zA-Z_]\w*)\s*\(.*?\).*$",
+        replacement=r"\g<0>",
+        description="functional macro - migrate to constexpr inline function",
+        ast_triggers=("functional_macro",),
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"^\s*(.*?;)\s*\n\s*\1\s*$",
+        replacement=r"\1",
+        description="redundant duplicate statement - removed consecutive call",
+        hint_only=False,
+    ),
 ]
 
 

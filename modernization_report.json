@@ -1,8 +1,8 @@
 {
   "file": "tests\\data\\test.cpp",
   "metrics": {
-    "legacy_pattern_count": 32,
-    "function_count": 13,
+    "legacy_pattern_count": 38,
+    "function_count": 21,
     "ast_depth": 10
   },
   "semantic": {
@@ -13,7 +13,7 @@
     "success": true,
     "errors": [],
     "warnings": [],
-    "compilation_time_ms": 1850,
+    "compilation_time_ms": 1914,
     "raw_stdout": "",
     "raw_stderr": "",
     "compiler": "C:\\msys64\\mingw64\\bin\\g++.EXE"

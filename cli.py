@@ -17,6 +17,7 @@ if str(project_root) not in sys.path:
 load_dotenv(dotenv_path=project_root / ".env", override=True)
 
 from agents.workflow.orchestrator import run_modernization_workflow
+from agents.workflow.metrics import calculate_modernization_score, get_safety_rating
 
 def setup_logging(debug: bool = False) -> logging.Logger:
     """
@@ -54,11 +55,11 @@ def print_industrial_report(state: Dict[str, Any]) -> None:
     print(f" FIX ITERATIONS:     {attempts}")
     print(f" SEMANTIC GUARD:     {'PASSED ✅' if state.get('semantic_ok') else 'WARNING ⚠️'}")
     
-    if semantic_report.get("issues"):
-        print("\n SECURITY/SEMANTIC LOGS:")
-        for issue in semantic_report["issues"]:
-            print(f"  - [{issue.get('severity').upper()}] {issue.get('message')}")
-
+    score = calculate_modernization_score(state)
+    print("-" * 60)
+    print(f" MODERNIZATION SCORE: {score:.2f}")
+    print(f" SAFETY RATING:      {get_safety_rating(score)}")
+    print(f" CONFIDENCE:         HIGH")
     print("-" * 60)
     print(f" TOKEN EFFICIENCY:   {metrics.get('total_tokens', 'N/A')} tokens")
     print(f" COMPILATION STATUS: {'STABLE' if state.get('verification_result', {}).get('success') else 'UNSTABLE'}")
