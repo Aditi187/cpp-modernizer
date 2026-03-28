@@ -63,8 +63,7 @@ def attempt_compiler_error_autofix(
     compile_errors: str
 ) -> Tuple[str, Dict[str, Any], str]:
     """
-    Attempts to fix compiler errors using the LLM, with robust error handling and logging.
-    Returns (fixed_code, verification_result, reason).
+    Attempts to fix compiler errors using the LLM with INDUSTRIAL CONSTRAINTS.
     """
     code_snapshot = str(state.get("modernized_code") or "")
     if not code_snapshot.strip():
@@ -78,31 +77,33 @@ def attempt_compiler_error_autofix(
     try:
         client = ModelClient(context)
         error_context = build_error_context_snippets(compile_errors, code_snapshot)
+        
         autofix_prompt_parts = [
-            "Fix this full C++17 file based on compiler errors.",
-            "MANDATORY REQUIREMENTS:",
-            "1. Output ONLY corrected C++ code.",
-            "2. Use 'mutable' for logical const-ness (e.g., mutable std::ofstream) to allow logging from const methods.",
-            "3. Use 'std::string_view' for read-only string parameters.",
-            "4. Use thread-safe 'localtime_s' (Windows style) for time conversion.",
-            "5. Replicate legacy formatting character-for-character relative to original output.",
-            "Compiler errors:",
+            "FIX ONLY COMPILATION ERRORS. DO NOT REFACTOR. DO NOT CHANGE SIGNATURES.",
+            "MANDATORY CONSTRAINTS:",
+            "1. Fix ONLY the specific compilation errors reported below.",
+            "2. DO NOT change function names, return types, or parameter lists.",
+            "3. PRESERVE all existing includes. AVOID adding new headers unless essential for a standard C++17 fix.",
+            "4. DO NOT attempt to 'further modernize' or improve code style in this phase.",
+            "5. Maintain absolute logic parity with the provided code snippet.",
+            "COMPILER ERRORS:",
             compile_errors,
         ]
         if error_context:
             autofix_prompt_parts.extend([
-                "Error context:",
+                "ERROR CONTEXT (LINES WITH ISSUES):",
                 error_context
             ])
         autofix_prompt_parts.extend([
-            "Code:",
+            "CODE TO FIX:",
             "```cpp",
             code_snapshot,
             "```"
         ])
         autofix_prompt = "\n\n".join(autofix_prompt_parts)
+        
         raw_text = client.call(
-            "You are AGENT 3: FIXER. Fix ONLY compiler errors minimally. Output valid C++17.",
+            "You are AGENT 3: FIXER. Perform minimal code repair to solve compilation errors only. No refactoring.",
             autofix_prompt,
             role="fixer"
         )
@@ -117,33 +118,32 @@ def attempt_compiler_error_autofix(
             
         retry_verification = compile_cpp_source(candidate)
         if not retry_verification.get("success"):
-            logger.error("[fixer] LLM fix did not compile.")
+            logger.error("[fixer] LLM repair did not compile.")
             return "", retry_verification, "compile-autofix did not compile"
             
-        logger.info("[fixer] LLM fix successful.")
+        logger.info("[fixer] LLM repair successful: Compiler errors resolved.")
         return candidate, retry_verification, ""
     except Exception as e:
-        logger.exception("[fixer] Exception during autofix.", exc_info=True)
+        logger.exception("[fixer] Exception during industrial repair.", exc_info=True)
         return "", {}, f"fixer failed: {e}"
 
 def fixer_node(state: ModernizationState) -> ModernizationState:
     """
-    Fixer node: Attempts to fix compiler errors reported in state["error_log"].
-    Applies LLM-based fix, robust error handling, and logs all outcomes.
+    Fixer node: Attempts to fix compiler errors with minimal footprint.
     """
-    logger.info(">>> [FIXER] Entering error repair phase based on compiler feedback")
+    logger.info(">>> [FIXER] Entering minimal repair phase for compilation artifacts")
     error_log = state.get("error_log", "")
     if not error_log:
-        logger.warning("[fixer] No error log found for fixer – skipping.")
+        logger.info("[fixer] No errors detected - skipping repair phase.")
         return state
         
     fixed_code, result, reason = attempt_compiler_error_autofix(state, error_log)
     if fixed_code and result.get("success"):
-        logger.info(">>> [FIXER] Repair successful: Compiler errors resolved.")
+        logger.info(">>> [FIXER] Repair SUCCESS: Native compiler now accepts the code.")
         state["modernized_code"] = fixed_code
         state["verification_result"] = result
         state["error_log"] = ""
     else:
-        logger.warning(f"[fixer] Failed to generate a working fix: {reason}")
+        logger.warning(f">>> [FIXER] Repair FAILED: {reason}")
         
     return state

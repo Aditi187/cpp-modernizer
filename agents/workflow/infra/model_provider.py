@@ -36,6 +36,7 @@ class ProviderError(Exception): pass
 class RateLimitError(ProviderError): pass
 class ProviderQuotaExhaustedError(ProviderError): pass
 class ModelUnavailableError(ProviderError): pass
+class ContextExhaustedError(ProviderError): pass
 
 
 def _env(key: str, default: str = "") -> str:
@@ -101,6 +102,7 @@ def _with_retry(fn, max_attempts: int = 15, base_wait: float = 30.0):
         except Exception:
             raise
     logger.error(f"Rate limit persisted after {max_attempts} attempts: {last_err}")
+    print(f"[ERROR] ModelProvider: Rate limit persisted after {max_attempts} attempts.")
     raise RateLimitError(f"Rate limit persisted after {max_attempts} attempts: {last_err}")
 
 
@@ -152,9 +154,11 @@ def _call_llm(role: str, system: str, user: str, context: Optional[WorkflowConte
         logger.debug("LLM [%s/%s] returned %d chars.", role, cfg.model, len(raw))
         if context is not None and cache_key:
             context.cache_llm_response(cache_key, raw)
+        print(f"[WORKING] ModelProvider: LLM call successful for role={role} (model={cfg.model})")
         return raw
     except Exception as e:
         logger.error("LLM call failed for role=%s: %s", role, e)
+        print(f"[ERROR] ModelProvider: LLM call failed for role={role}: {e}")
         return None
 
 
@@ -209,6 +213,7 @@ class ModelClient:
     # ------------------------------------------------------------------
     def call(self, system_prompt: str, user_prompt: str, role: str = "modernizer") -> Optional[str]:
         logger.info("ModelClient.call  role=%-12s  llm=%s", role, self._use_llm)
+        print(f"[WORKING] ModelClient: Requesting {role} (LLM enabled: {self._use_llm})")
 
         # --- LLM path with exponential backoff and caching ---
         if self._use_llm:

@@ -1,325 +1,201 @@
+from __future__ import annotations
+
 import re
-import logging
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Tuple
 
-
-logger = logging.getLogger(__name__)
-
-
-# ==========================================================
-# RULE STRUCTURE
-# ==========================================================
 
 class ModernizationRule:
-
     def __init__(
-
         self,
-
         pattern: str,
-
         replacement: str,
-
         description: str,
-
-        safe: bool = True
-
+        ast_triggers: tuple[str, ...] = (),
+        hint_only: bool = False,
     ):
-
-        self.pattern = re.compile(
-
-            pattern,
-
-            re.MULTILINE
-        )
-
+        self.pattern = re.compile(pattern, re.MULTILINE)
         self.replacement = replacement
-
         self.description = description
+        self.ast_triggers = ast_triggers
+        self.hint_only = hint_only
 
-        self.safe = safe
+
+_RULES: List[ModernizationRule] = [
+    # ------------------------------------------------------
+    # LAYER 1: DETERMINISTIC REWRITES (Normalization/Enforcement)
+    # ------------------------------------------------------
+    ModernizationRule(
+        pattern=r"\bNULL\b",
+        replacement="nullptr",
+        description="NULL -> nullptr",
+        ast_triggers=("null_macro",),
+    ),
+    ModernizationRule(
+        pattern=r"\btypedef\s+([^;{}]+?)\s+([A-Za-z_]\w*)\s*;",
+        replacement=r"using \2 = \1;",
+        description="typedef -> using",
+    ),
+    ModernizationRule(
+        pattern=r"\bthrow\s*\(\s*\)",
+        replacement="noexcept",
+        description="throw() -> noexcept",
+    ),
+    # Macro constants -> constexpr
+    ModernizationRule(
+        pattern=r"^\s*#\s*define\s+([A-Z][A-Z0-9_]*)\s+([0-9]+(?:\.[0-9]+)?f?L?U?L?)\b.*$",
+        replacement=r"constexpr auto \1 = \2;",
+        description="#define constant -> constexpr",
+    ),
+    # C Headers -> C++ Headers
+    ModernizationRule(
+        pattern=r"#\s*include\s*<stdio\.h>",
+        replacement="#include <cstdio>",
+        description="<stdio.h> -> <cstdio>",
+    ),
+    ModernizationRule(
+        pattern=r"#\s*include\s*<stdlib\.h>",
+        replacement="#include <cstdlib>",
+        description="<stdlib.h> -> <cstdlib>",
+    ),
+    ModernizationRule(
+        pattern=r"#\s*include\s*<string\.h>",
+        replacement="#include <cstring>",
+        description="<string.h> -> <cstring>",
+    ),
+    ModernizationRule(
+        pattern=r"#\s*include\s*<time\.h>",
+        replacement="#include <ctime>",
+        description="<time.h> -> <ctime>",
+    ),
+
+    # ------------------------------------------------------
+    # LAYER 2: HINTS (Semantic guidance for LLM)
+    # ------------------------------------------------------
+    ModernizationRule(
+        pattern=r"\(\s*([A-Za-z_][A-Za-z0-9_:<>]*)\s*\)\s*([A-Za-z_][A-Za-z0-9_]*)",
+        replacement=r"\g<0>",
+        description="C-style cast - consider static_cast",
+        ast_triggers=("c_style_cast",),
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"\bchar\s*\*\s*([A-Za-z_]\w*)\b",
+        replacement=r"\g<0>",
+        description="char* pointer - consider std::string or std::string_view",
+        ast_triggers=("char_pointer",),
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"\bstd\s*::\s*auto_ptr\b",
+        replacement="std::unique_ptr",
+        description="std::auto_ptr -> std::unique_ptr (deprecated)",
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"\bprintf\s*\(",
+        replacement=r"\g<0>",
+        description="printf detected - consider std::cout or std::print (C++23)",
+        ast_triggers=("printf_usage",),
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"\bmalloc\s*\(",
+        replacement=r"\g<0>",
+        description="malloc usage - migrate to make_unique / vector",
+        ast_triggers=("malloc_usage",),
+        hint_only=True,
+    ),
+    ModernizationRule(
+        pattern=r"\bfree\s*\(",
+        replacement=r"\g<0>",
+        description="free usage - replace with smart pointer ownership",
+        ast_triggers=("free_usage",),
+        hint_only=True,
+    ),
+]
 
 
-# ==========================================================
-# RULE ENGINE
-# ==========================================================
+_COMMENTS_AND_STRINGS_RE = re.compile(
+    r"//[^\n]*|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'",
+    re.DOTALL,
+)
 
-class RuleModernizer:
 
+def _mask_comments_and_strings(code: str) -> str:
+    """Return code with comments/string literals replaced by spaces.
+
+    Keeps length and newlines stable so regex match spans still align with the
+    original source for safe substitutions.
     """
-    deterministic regex-based modernization engine.
 
-    applies safe mechanical transformations
-    without altering program logic.
-    """
+    def _blank(match: re.Match[str]) -> str:
+        return re.sub(r"[^\n]", " ", match.group(0))
 
-    # ======================================================
-    # SAFE RULE SET
-    # ======================================================
+    return _COMMENTS_AND_STRINGS_RE.sub(_blank, code)
 
-    RULES: List[ModernizationRule] = [
 
-        # typedef → using
-        ModernizationRule(
+def _apply_rule_outside_comments_and_strings(code: str, rule: ModernizationRule) -> Tuple[str, int]:
+    """Apply a regex replacement only on code tokens, skipping comments/strings."""
+    masked = _mask_comments_and_strings(code)
+    matches = list(rule.pattern.finditer(masked))
+    if not matches:
+        return code, 0
 
-            r"\btypedef\s+(.+?)\s+([A-Za-z_]\w*)\s*;",
+    chunks: List[str] = []
+    cursor = 0
+    substitutions = 0
 
-            r"using \2 = \1;",
+    for match in matches:
+        start, end = match.span()
+        chunks.append(code[cursor:start])
+        chunks.append(match.expand(rule.replacement))
+        cursor = end
+        substitutions += 1
 
-            "typedef -> using"
-        ),
+    chunks.append(code[cursor:])
+    return "".join(chunks), substitutions
 
-        # NULL → nullptr
-        ModernizationRule(
-
-            r"\bNULL\b",
-
-            "nullptr",
-
-            "NULL -> nullptr"
-        ),
-
-        # char array → std::string
-        ModernizationRule(
-
-            r"char\s+([A-Za-z_]\w*)\s*\[\s*\d+\s*\]\s*;",
-
-            r"std::string \1;",
-
-            "char[] -> std::string"
-        ),
-
-        # strcpy → assignment
-        ModernizationRule(
-
-            r"strcpy\s*\(\s*(\w+)\s*,\s*\"([^\"]*)\"\s*\)\s*;",
-
-            r'\1 = "\2";',
-
-            "strcpy -> assignment"
-        ),
-
-        # strlen → size()
-        ModernizationRule(
-
-            r"strlen\s*\(\s*(\w+)\s*\)",
-
-            r"\1.size()",
-
-            "strlen -> size"
-        ),
-
-        # std::auto_ptr → std::unique_ptr
-        ModernizationRule(
-
-            r"std::auto_ptr<",
-
-            "std::unique_ptr<",
-
-            "auto_ptr -> unique_ptr"
-        ),
-
-        # throw() → noexcept
-        ModernizationRule(
-
-            r"\bthrow\s*\(\s*\)",
-
-            "noexcept",
-
-            "throw() -> noexcept"
-        ),
-
-        # simple printf → cout
-        ModernizationRule(
-
-            r'printf\s*\(\s*"([^"]*)"\s*\)\s*;',
-
-            r'std::cout << "\1";',
-
-            "printf -> cout"
-        ),
-
-        # fopen read → ifstream
-        ModernizationRule(
-
-            r'FILE\s*\*\s*(\w+)\s*=\s*fopen\(([^,]+),\s*"r"\);',
-
-            r"std::ifstream \1(\2);",
-
-            "fopen -> ifstream"
-        ),
-
-        # fopen write → ofstream
-        ModernizationRule(
-
-            r'FILE\s*\*\s*(\w+)\s*=\s*fopen\(([^,]+),\s*"w"\);',
-
-            r"std::ofstream \1(\2);",
-
-            "fopen -> ofstream"
-        ),
-
-        # fclose removal
-        ModernizationRule(
-
-            r'fclose\s*\(\s*(\w+)\s*\)\s*;',
-
-            r"// handled by RAII",
-
-            "fclose removed"
-        ),
-
-        # malloc char buffer → vector
-        ModernizationRule(
-
-            r'char\s*\*\s*(\w+)\s*=\s*\(char\*\)\s*malloc\s*\(([^)]*)\);',
-
-            r"std::vector<char> \1(\2);",
-
-            "malloc buffer -> vector"
-        ),
-
-        # new → make_unique
-        ModernizationRule(
-
-            r'(\w+)\s*=\s*new\s+([A-Za-z_]\w*)\s*\(([^)]*)\);',
-
-            r"auto \1 = std::make_unique<\2>(\3);",
-
-            "new -> make_unique"
-        ),
-
-        # delete removal
-        ModernizationRule(
-
-            r"delete\s+(\w+)\s*;",
-
-            r"// handled by smart pointer",
-
-            "delete removed"
-        ),
-    ]
-
-    # ======================================================
-    # COMMENT MASKING
-    # ======================================================
-
-    COMMENT_PATTERN = re.compile(
-
-        r"//.*?$|/\*.*?\*/|\"(?:\\.|[^\"\\])*\"",
-
-        re.DOTALL | re.MULTILINE
-    )
-
-    def _mask_comments(
-
-        self,
-
-        code: str
-
-    ) -> str:
-
-        return self.COMMENT_PATTERN.sub(
-
-            lambda m: " " * len(m.group()),
-
-            code
-        )
-
-    # ======================================================
-    # APPLY RULES
-    # ======================================================
-
-    def modernize_text(
-
-        self,
-
-        code: str
-
-    ) -> str:
-
-        if not code:
-
-            return code
-
-        updated = code
-
-        masked = self._mask_comments(updated)
-
-        total_changes = 0
-
-        for rule in self.RULES:
-
-            matches = list(
-
-                rule.pattern.finditer(masked)
-            )
-
-            if not matches:
-
-                continue
-
-            pieces = []
-
-            cursor = 0
-
-            for match in matches:
-
-                start, end = match.span()
-
-                pieces.append(
-
-                    updated[cursor:start]
-                )
-
-                pieces.append(
-
-                    match.expand(
-                        rule.replacement
-                    )
-                )
-
-                cursor = end
-
-            pieces.append(
-
-                updated[cursor:]
-            )
-
-            updated = "".join(pieces)
-
-            masked = self._mask_comments(updated)
-
-            total_changes += len(matches)
-
-        if total_changes > 0:
-
-            logger.info(
-
-                f"[rule_modernizer] applied {total_changes} transformations"
-
-            )
-
-        # never return empty string
-        if not updated.strip():
-
-            return code
-
-        return updated
-
-
-# ==========================================================
-# FUNCTION WRAPPER
-# ==========================================================
 
 def apply_modernization_rules(
-
-    code: str
-
+    code: str,
+    detected_patterns: Dict[str, int] | None = None,
 ) -> Tuple[str, List[str]]:
+    """Apply modernization rules and return updated code with applied descriptions.
 
-    engine = RuleModernizer()
+    Rules are evaluated sequentially and each rule sees modifications produced by
+    earlier rules. This ordering is intentional so deterministic rewrites can be
+    composed in a predictable way.
+    """
+    updated_code = code
+    applied_descriptions: List[str] = []
+    active_patterns = detected_patterns or {}
 
-    updated = engine.modernize_text(code)
+    for rule in _RULES:
+        if rule.ast_triggers:
+            trigger_active = any(int(active_patterns.get(name, 0) or 0) > 0 for name in rule.ast_triggers)
+            if not trigger_active and active_patterns:
+                continue
 
-    return updated, []
+        if rule.hint_only:
+            masked = _mask_comments_and_strings(updated_code)
+            substitutions = sum(1 for _ in rule.pattern.finditer(masked))
+        else:
+            updated_code, substitutions = _apply_rule_outside_comments_and_strings(updated_code, rule)
+
+        if substitutions > 0:
+            applied_descriptions.append(f"{rule.description} ({substitutions} times)")
+            print(f"[WORKING] RuleModernizer: Applied '{rule.description}' ({substitutions} times)")
+
+    return updated_code, applied_descriptions
+
+
+class RuleModernizer:
+    """Wrapper class for modernization rules to maintain compatibility with ModelClient."""
+
+    def __init__(self):
+        pass
+
+    def modernize_text(self, text: str) -> str:
+        """Apply modernization rules to the provided text."""
+        updated, _ = apply_modernization_rules(text)
+        return updated

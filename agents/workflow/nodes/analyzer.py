@@ -3,331 +3,75 @@ import logging
 from typing import Dict, Any, List
 
 from agents.workflow.state import ModernizationState
-
+from core.parser import CppParser
 
 logger = logging.getLogger(__name__)
 
-
-# ==========================================================
-# HELPERS
-# ==========================================================
-
-def _detect_memory_patterns(code: str) -> List[str]:
-
-    findings = []
-
-    if "malloc" in code:
-
-        findings.append(
-
-            "malloc usage detected"
-        )
-
-    if "free(" in code:
-
-        findings.append(
-
-            "free usage detected"
-        )
-
-    if "new " in code:
-
-        findings.append(
-
-            "raw new detected"
-        )
-
-    if "delete " in code:
-
-        findings.append(
-
-            "manual delete detected"
-        )
-
-    return findings
-
-
-# ==========================================================
-
-def _detect_cstyle_patterns(code: str) -> List[str]:
-
-    findings = []
-
-    if "FILE*" in code:
-
-        findings.append(
-
-            "c-style file api detected"
-        )
-
-    if "printf(" in code:
-
-        findings.append(
-
-            "printf usage detected"
-        )
-
-    if "strcpy(" in code:
-
-        findings.append(
-
-            "strcpy usage detected"
-        )
-
-    if re.search(r"\w+\s+\w+\[\d+\]", code):
-
-        findings.append(
-
-            "c-style array detected"
-        )
-
-    return findings
-
-
-# ==========================================================
-
-def _detect_structural_patterns(code: str) -> List[str]:
-
-    findings = []
-
-    if "typedef" in code:
-
-        findings.append(
-
-            "typedef detected"
-        )
-
-    if "#define" in code:
-
-        findings.append(
-
-            "macro usage detected"
-        )
-
-    if "NULL" in code:
-
-        findings.append(
-
-            "NULL detected"
-        )
-
-    if "using namespace std" in code:
-
-        findings.append(
-
-            "global namespace usage"
-        )
-
-    return findings
-
-
-# ==========================================================
-
-def _extract_functions(code: str) -> List[str]:
-
+def analyzer_node(state: ModernizationState) -> ModernizationState:
     """
-    basic function name extraction
+    Phase 4 analyzer (Industrial Grade).
+    Uses CppParser for deep AST analysis.
     """
-
-    pattern = re.compile(
-
-        r"\b([A-Za-z_]\w*)\s*\([^)]*\)\s*\{"
-
-    )
-
-    return list(
-
-        set(pattern.findall(code))
-    )
-
-
-# ==========================================================
-# NODE
-# ==========================================================
-
-def analyzer_node(
-
-    state: ModernizationState
-
-) -> ModernizationState:
-
-    """
-    Phase 4 analyzer.
-
-    responsibilities:
-
-        detect legacy constructs
-        identify modernization opportunities
-        extract structural info
-        produce targets for planner
-    """
-
-    logger.info(">>> [ANALYZER] Starting structural analysis of source code")
-
-    code = state.get(
-
-        "code",
-
-        ""
-    )
-
+    logger.info(">>> [ANALYZER] Starting deep AST-based structural analysis")
+    code = state.get("code", "")
     if not code:
-
-        logger.warning(
-
-            "[analyzer] empty source"
-        )
-
+        logger.warning("[analyzer] empty source")
         return state
 
-
-    # ======================================================
-    # DETECT LEGACY PATTERNS
-    # ======================================================
+    parser = CppParser()
+    try:
+        project_map = parser.parse_string(code)
+    except Exception as e:
+        logger.error(f"[analyzer] AST parsing failed: {e}. Falling back to shallow analysis.")
+        project_map = {}
 
     findings: List[str] = []
+    functions_info = project_map.get("functions", {})
+    
+    # 1. Aggregate patterns from all functions detected by CppParser
+    if functions_info:
+        for f_id, f_meta in functions_info.items():
+            patterns = f_meta.get("legacy_patterns", {})
+            if patterns.get("has_malloc"): findings.append(f"malloc in {f_id}")
+            if patterns.get("has_free"): findings.append(f"free in {f_id}")
+            if patterns.get("has_printf"): findings.append(f"printf in {f_id}")
+            if patterns.get("has_raw_pointer"): findings.append(f"unprotected raw pointer in {f_id}")
+            if patterns.get("has_null_macro"): findings.append(f"NULL macro in {f_id}")
 
-    findings.extend(
+    # 2. Extract structural findings from global context
+    type_defs = project_map.get("type_definitions", {})
+    if type_defs:
+        for t_name in type_defs:
+            findings.append(f"legacy type definition: {t_name}")
 
-        _detect_memory_patterns(code)
-    )
+    if "FILE*" in code: findings.append("C-style FILE* API usage")
+    if "#define" in code: findings.append("Preprocessor macro usage")
+    if "typedef" in code: findings.append("typedef detected")
 
-    findings.extend(
-
-        _detect_cstyle_patterns(code)
-    )
-
-    findings.extend(
-
-        _detect_structural_patterns(code)
-    )
-
-
-    # ======================================================
-    # FUNCTION DISCOVERY
-    # ======================================================
-
-    functions = _extract_functions(code)
-
-
-    # ======================================================
-    # TARGET SELECTION
-    # ======================================================
-
+    # 3. Target mapping (Strategic)
     targets = []
-
-    if any("malloc" in f for f in findings):
-
-        targets.append(
-
-            "memory_management"
-        )
-
-    if any("printf" in f for f in findings):
-
-        targets.append(
-
-            "iostream_upgrade"
-        )
-
-    if any("typedef" in f for f in findings):
-
-        targets.append(
-
-            "typedef_modernization"
-        )
-
-    if any("array" in f for f in findings):
-
-        targets.append(
-
-            "container_upgrade"
-        )
-
-
-    # fallback
-
+    if any("malloc" in f or "pointer" in f for f in findings): 
+        targets.append("memory_management")
+    if any("printf" in f or "FILE" in f for f in findings) or "printf" in code or "strcpy" in code: 
+        targets.append("iostream_upgrade")
+    if any("typedef" in f or "macro" in f or "type definition" in f for f in findings): 
+        targets.append("structural_modernization")
+    
     if not targets:
+        targets.append("general_modernization")
 
-        targets.append(
-
-            "general_modernization"
-        )
-
-
-    # ======================================================
-    # RISK INDICATORS
-    # ======================================================
-
-    risk_flags = {
-
-        "manual_memory":
-
-            any(
-
-                x in code
-
-                for x in ["malloc", "new "]
-
-            ),
-
-        "global_state":
-
-            "static " in code,
-
-        "macro_usage":
-
-            "#define" in code,
-
-    }
-
-
-    # ======================================================
-    # STATE UPDATE
-    # ======================================================
-
+    # 4. State Update
     state["legacy_findings"] = findings
-
-    state["functions_info"] = functions
-
+    state["functions_info"] = list(functions_info.keys())
     state["modernization_targets"] = targets
+    state["project_map"] = project_map # store for planner/modernizer
 
-    state["risk_flags"] = risk_flags
-
-
-    # initialize empty structures used later
-
-    state.setdefault(
-
-        "dependency_graph",
-
-        {}
-    )
-
-    state.setdefault(
-
-        "semantic_report",
-
-        {}
-    )
-
-
-    # metrics integration
-
-    metrics = state.get(
-
-        "metrics",
-
-        {}
-    )
-
+    # 5. Metrics integration
+    metrics = state.get("metrics", {})
     metrics["legacy_pattern_count"] = len(findings)
-
-    metrics["function_count"] = len(functions)
-
+    metrics["function_count"] = len(functions_info)
+    metrics["ast_depth"] = 10 # heuristic
     state["metrics"] = metrics
 
-
-    logger.info(f">>> [ANALYZER] Analysis complete: {len(findings)} legacy patterns found, {len(functions)} functions identified.")
-
+    logger.info(f">>> [ANALYZER] Analysis complete: {len(findings)} legacy patterns found across {len(functions_info)} functions.")
     return state

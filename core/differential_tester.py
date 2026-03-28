@@ -1,253 +1,76 @@
-from __future__ import annotations
-
-import logging
 import os
 import platform
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
-import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from difflib import unified_diff
 from typing import Any
 
-try:
-    import psutil  # type: ignore[import-not-found]
 
-    HAS_PSUTIL = True
-except ImportError:
-    HAS_PSUTIL = False
+# ---------------------------------------------------------------------------
+# Sanitizer configuration
+# ---------------------------------------------------------------------------
 
-_log = logging.getLogger(__name__)
-
-_VERIFIED_COMPILERS: set[str] = set()
-_VERIFIED_COMPILERS_LOCK = threading.Lock()
-_SANITIZER_COMPILE_FLAGS = [
+_SANITIZER_COMPILE_FLAGS: list[str] = [
     "-fsanitize=address,undefined",
     "-fno-omit-frame-pointer",
 ]
-_CRASH_STDERR_PATTERN = re.compile(
-    r"(?:segmentation fault|access violation|illegal instruction|"
-    r"floating point exception|aborted|stack overflow|core dumped|"
-    r"SUMMARY:|ERROR:\s*(?:address|leak|undefined))",
-    re.IGNORECASE,
-)
-
-@dataclass(frozen=True)
-class TesterConfig:
-    compile_timeout_seconds: int = 30
-    run_timeout_seconds: int = 30
-    enable_sanitizers_modernized: bool = True
-    sanitize_original: bool = False
-    compiler_path: str = ""
-    sanitizer_flags: list[str] = field(default_factory=lambda: [
-        "-fsanitize=address,undefined",
-        "-fno-omit-frame-pointer",
-    ])
-    filter_sanitizer_stderr: bool = True
-    max_test_cases: int = 0
-    debug: bool = False
-    link_flags: list[str] = field(default_factory=list)
-
-    @classmethod
-    def from_env(cls) -> TesterConfig:
-
-        def _env_int(name: str, default: int) -> int:
-            try:
-                return int(os.environ.get(f"TESTER_{name}".upper(), str(default)))
-            except ValueError:
-                return default
-
-        def _env_bool(name: str, default: bool) -> bool:
-            val = os.environ.get(f"TESTER_{name}".upper(), "").lower()
-            if val in ("true", "1", "yes"):
-                return True
-            if val in ("false", "0", "no"):
-                return False
-            return default
-
-        return cls(
-            compile_timeout_seconds=_env_int("compile_timeout_seconds", 30),
-            run_timeout_seconds=_env_int("run_timeout_seconds", 30),
-            enable_sanitizers_modernized=_env_bool("enable_sanitizers_modernized", True),
-            sanitize_original=_env_bool("sanitize_original", False),
-            compiler_path=os.environ.get("TESTER_COMPILER_PATH", "").strip(),
-            filter_sanitizer_stderr=_env_bool("filter_sanitizer_stderr", True),
-            max_test_cases=_env_int("max_test_cases", 0),
-            debug=_env_bool("debug", False),
-            link_flags=os.environ.get("TESTER_LINK_FLAGS", "").split(),
-        )
-
-
-@dataclass
-class CompilerCapabilities:
-    compiler_path: str
-    version_string: str
-    supports_cpp17: bool = False
-    supports_sanitizers: bool = False
-    supports_asan_stderr_capture: bool = False
-
-
-_COMPILER_CAPABILITIES_CACHE: dict[str, CompilerCapabilities] = {}
-_COMPILER_CAPABILITIES_LOCK = threading.Lock()
-
-
-def detect_compiler_capabilities(
-    compiler_path: str, timeout_seconds: int = 5
-) -> CompilerCapabilities:
-    with _COMPILER_CAPABILITIES_LOCK:
-        if compiler_path in _COMPILER_CAPABILITIES_CACHE:
-            _log.debug(f"Cache hit for compiler capabilities: {compiler_path}")
-            return _COMPILER_CAPABILITIES_CACHE[compiler_path]
-
-    _log.debug(f"Detecting compiler capabilities for: {compiler_path}")
-
-    try:
-        result = subprocess.run(
-            [compiler_path, "--version"],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-        )
-        version_string = (result.stdout or "").strip().split("\n")[0]
-    except Exception as exc:
-        raise RuntimeError(f"Failed to get compiler version: {exc}") from exc
-
-    supports_cpp17 = _test_compiler_flag(compiler_path, "-std=c++17", timeout_seconds)
-
-    supports_sanitizers = _test_compiler_flag(
-        compiler_path,
-        "-fsanitize=address",
-        timeout_seconds,
-    )
-
-    supports_asan_stderr = supports_sanitizers
-    
-    capabilities = CompilerCapabilities(
-        compiler_path=compiler_path,
-        version_string=version_string,
-        supports_cpp17=supports_cpp17,
-        supports_sanitizers=supports_sanitizers,
-        supports_asan_stderr_capture=supports_asan_stderr,
-    )
-
-    with _COMPILER_CAPABILITIES_LOCK:
-        _COMPILER_CAPABILITIES_CACHE[compiler_path] = capabilities
-
-    _log.debug(
-        f"Compiler capabilities: C++17={supports_cpp17}, Sanitizers={supports_sanitizers}"
-    )
-
-    return capabilities
-
-
-def _test_compiler_flag(
-    compiler_path: str, flag: str, timeout_seconds: int
-) -> bool:
-    test_code = "int main() { return 0; }\n"
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            cpp_file = os.path.join(tmp, "test.cpp")
-            exe_file = os.path.join(tmp, "test.exe")
-            with open(cpp_file, "w") as f:
-                f.write(test_code)
-
-            result = subprocess.run(
-                [compiler_path, flag, cpp_file, "-o", exe_file],
-                capture_output=True,
-                timeout=timeout_seconds,
-            )
-            return result.returncode == 0
-    except Exception as exc:
-        _log.debug(f"Compiler flag test failed for {flag}: {exc}")
-        return False
-
-
-def _detect_crash_reason(
-    exit_code: int | None,
-    stderr_text: str,
-    timed_out: bool,
-    platform_name: str | None = None,
-) -> str:
-    if timed_out:
-        return "timeout"
-
-    if exit_code is None:
-        return "execution_error"
-
-    current_platform = platform_name or platform.system()
-
-    if _CRASH_STDERR_PATTERN.search(stderr_text or ""):
-        return "Process crashed (detected from stderr)."
-
-    if exit_code != 0:
-        if current_platform == "Windows":
-            win_exceptions = {
-                0xC0000005: "Access Violation",
-                0xC000001D: "Illegal Instruction",
-                0xC0000094: "Integer Division by Zero",
-                0xC0000FD:  "Stack Overflow",
-                0xC000002B: "Stack Buffer Overrun",
-                0xC0000008: "Invalid Handle",
-                0xC0000017: "No Memory",
-                0xC000013A: "Control-C Exit",
-            }
-            # Many Windows exit codes for crashes appear as large positive unsigned 32-bit ints
-            unsigned_code = exit_code & 0xFFFFFFFF
-            if unsigned_code in win_exceptions:
-                return f"Process terminated with exception {unsigned_code:#x} ({win_exceptions[unsigned_code]})."
-        
-        if exit_code < 0:
-            signal_num = -exit_code
-            if current_platform != "Windows":
-                try:
-                    sig_name = signal.Signals(signal_num).name
-                    return f"Process terminated by signal {signal_num} ({sig_name})."
-                except (ValueError, AttributeError):
-                    return f"Process terminated by signal {signal_num}."
-            else:
-                return f"Process terminated with exception {signal_num:#x}."
-
-        return f"Process exited with non-zero status {exit_code}."
-
-    return ""
-
-
-def _get_peak_memory_kb(stderr_text: str) -> int | None:
-    if not stderr_text:
-        return None
-
-    if match := re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr_text):
-        return int(match.group(1))
-    if match := re.search(r"(\d+)\s+byte\(s\)\s+allocated", stderr_text):
-        return max(1, int(match.group(1)) // 1024)
-    return None
-
 
 _SANITIZER_ERROR_PATTERN = re.compile(
     r"(?:AddressSanitizer|UndefinedBehaviorSanitizer|LeakSanitizer|ERROR:\s*(?:address|leak|undefined))",
     re.IGNORECASE,
 )
 
-_SANITIZER_STDERR_PATTERN = re.compile(
-    r"^(==\d+==|SUMMARY:|ASAN_OPTIONS|UBSAN_OPTIONS|\s*#\d+|Direct leak|Indirect leak)",
-    re.MULTILINE,
+_CRASH_STDERR_PATTERN = re.compile(
+    r"segmentation fault|access violation|illegal instruction|floating point exception|aborted|stack overflow",
+    re.IGNORECASE,
 )
+
+_VERIFIED_COMPILERS: set[str] = set()
+
+
+def _sanitizers_available() -> bool:
+    """Return False on Windows/MinGW where ASan/UBSan libs are typically missing."""
+    return platform.system() != "Windows"
 
 
 def _detect_sanitizer_errors(stderr_text: str) -> list[str]:
+    """Return a list of sanitizer diagnostic lines found in stderr output."""
     if not stderr_text:
         return []
-    return [line.strip() for line in stderr_text.splitlines() if _SANITIZER_ERROR_PATTERN.search(line)]
+    findings: list[str] = []
+    for line in stderr_text.splitlines():
+        if _SANITIZER_ERROR_PATTERN.search(line):
+            findings.append(line.strip())
+    return findings
 
 
-# Removed unused _filter_sanitizer_lines
+def _parse_peak_memory_kb(stderr_text: str) -> int | None:
+    """Extract peak resident-set size (KB) from ASan or /usr/bin/time output.
+
+    On Windows this commonly returns None because /usr/bin/time -v is unavailable.
+    """
+    if not stderr_text:
+        return None
+
+    # GNU time -v format.
+    match = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", stderr_text)
+    if match:
+        return int(match.group(1))
+
+    # ASan stats (bytes allocated -> convert to KB).
+    match = re.search(r"(\d+)\s+byte\(s\)\s+allocated", stderr_text)
+    if match:
+        return max(1, int(match.group(1)) // 1024)
+
+    return None
 
 
 def resolve_cpp_compiler(explicit_path: str | None = None) -> str:
+    """Resolve the C++ compiler path using explicit arg, env vars, and PATH probes."""
     if explicit_path:
         return explicit_path
 
@@ -270,9 +93,9 @@ def resolve_cpp_compiler(explicit_path: str | None = None) -> str:
 
 
 def _verify_compiler(compiler_path: str, timeout_seconds: int = 5) -> None:
-    with _VERIFIED_COMPILERS_LOCK:
-        if compiler_path in _VERIFIED_COMPILERS:
-            return
+    """Verify that the compiler is invokable, caching successful checks."""
+    if compiler_path in _VERIFIED_COMPILERS:
+        return
 
     try:
         result = subprocess.run(
@@ -290,8 +113,7 @@ def _verify_compiler(compiler_path: str, timeout_seconds: int = 5) -> None:
             f"C++ compiler sanity check failed with exit code {result.returncode}: {result.stderr}"
         )
 
-    with _VERIFIED_COMPILERS_LOCK:
-        _VERIFIED_COMPILERS.add(compiler_path)
+    _VERIFIED_COMPILERS.add(compiler_path)
 
 
 def _build_compile_command(
@@ -299,14 +121,11 @@ def _build_compile_command(
     source_path: str,
     exe_path: str,
     enable_sanitizers: bool,
-    link_flags: list[str] | None = None,
 ) -> list[str]:
-    cmd = [compiler_path, "-std=c++17", "-Wall"]
+    cmd = [compiler_path, "-std=c++23", "-Wall"]
     if enable_sanitizers:
         cmd.extend(_SANITIZER_COMPILE_FLAGS)
     cmd.extend([source_path, "-o", exe_path])
-    if link_flags:
-        cmd.extend(link_flags)
     return cmd
 
 
@@ -318,24 +137,6 @@ def _build_run_env(enable_sanitizers: bool) -> dict[str, str]:
     return env
 
 
-def _kill_process_tree(proc: subprocess.Popen) -> None:
-    if HAS_PSUTIL:
-        try:
-            parent = psutil.Process(proc.pid)
-            for child in parent.children(recursive=True):
-                child.kill()
-            parent.kill()
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    else:
-        try:
-            proc.kill()
-        except Exception:
-            pass
-            
 def _compile_to_exe(
     source_path: str,
     compiler_path: str,
@@ -343,28 +144,27 @@ def _compile_to_exe(
     exe_name: str,
     enable_sanitizers: bool,
     timeout_seconds: int,
-    link_flags: list[str] | None = None,
 ) -> dict[str, Any]:
+    """Compile one C++ source file into an executable and return compile metadata."""
     exe_path = os.path.join(tmp_dir, exe_name)
 
-    compile_cmd = _build_compile_command(compiler_path, source_path, exe_path, enable_sanitizers, link_flags)
+    if enable_sanitizers and not _sanitizers_available():
+        enable_sanitizers = False
+
+    compile_cmd = _build_compile_command(compiler_path, source_path, exe_path, enable_sanitizers)
     compile_env = _build_run_env(enable_sanitizers)
 
     start = time.time()
     try:
-        proc = subprocess.Popen(
+        result = subprocess.run(
             compile_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             text=True,
             encoding="utf-8",
+            timeout=timeout_seconds,
             env=compile_env,
         )
-        stdout_txt, stderr_txt = proc.communicate(timeout=timeout_seconds)
-        result_returncode = proc.returncode
     except subprocess.TimeoutExpired:
-        _kill_process_tree(proc)
-        proc.communicate()
         return {
             "compile_success": False,
             "stderr": f"Compilation timed out after {timeout_seconds} seconds.",
@@ -386,14 +186,35 @@ def _compile_to_exe(
         }
 
     return {
-        "compile_success": result_returncode == 0,
-        "stderr": (stderr_txt or "").strip(),
-        "stdout": (stdout_txt or "").strip(),
+        "compile_success": result.returncode == 0,
+        "stderr": (result.stderr or "").strip(),
+        "stdout": (result.stdout or "").strip(),
         "compile_time_ms": int((time.time() - start) * 1000),
         "exe_path": exe_path,
         "enable_sanitizers": enable_sanitizers,
         "timed_out": False,
     }
+
+
+def _detect_crash_reason(exit_code: int | None, stderr_text: str, timed_out: bool) -> str:
+    """Infer crash reason in a platform-tolerant way from stderr and exit code."""
+    if timed_out:
+        return "timeout"
+
+    if _CRASH_STDERR_PATTERN.search(stderr_text or ""):
+        return "Process crashed (detected from stderr)."
+
+    if exit_code is None:
+        return "execution_error"
+
+    # Negative return codes usually mean signal termination on Unix-like systems.
+    if exit_code < 0:
+        return f"Process terminated by signal {-exit_code} (platform-dependent)."
+
+    if exit_code != 0:
+        return f"Process exited with non-zero status {exit_code}."
+
+    return ""
 
 
 def _run_exe(
@@ -402,24 +223,23 @@ def _run_exe(
     timeout_seconds: int,
     env: dict[str, str],
 ) -> dict[str, Any]:
+    """Run a compiled executable once and return runtime diagnostics."""
     run_start = time.time()
-    run_cmd = [exe_path]
+    use_time_v = platform.system() != "Windows" and os.path.isfile("/usr/bin/time")
+    run_cmd = [exe_path] if not use_time_v else ["/usr/bin/time", "-v", exe_path]
 
     try:
-        proc = subprocess.Popen(
+        run_result = subprocess.run(
             run_cmd,
-            stdin=subprocess.PIPE if input_data is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            input=input_data if input_data is not None else None,
+            capture_output=True,
             text=True,
             encoding="utf-8",
+            timeout=timeout_seconds,
             env=env,
         )
-        stdout_txt, stderr_txt = proc.communicate(input=input_data, timeout=timeout_seconds)
-        result_returncode = proc.returncode
+        timed_out = False
     except subprocess.TimeoutExpired:
-        _kill_process_tree(proc)
-        proc.communicate()
         return {
             "compile_success": True,
             "run_success": False,
@@ -447,13 +267,13 @@ def _run_exe(
         }
 
     run_time_ms = int((time.time() - run_start) * 1000)
-    stdout_text = (stdout_txt or "").strip()
-    stderr_text = (stderr_txt or "").strip()
-    exit_code = int(result_returncode)
+    stdout_text = (run_result.stdout or "").strip()
+    stderr_text = (run_result.stderr or "").strip()
+    exit_code = int(run_result.returncode)
 
-    crash_reason = _detect_crash_reason(exit_code, stderr_text, timed_out=False)
+    crash_reason = _detect_crash_reason(exit_code, stderr_text, timed_out)
     sanitizer_findings = _detect_sanitizer_errors(stderr_text)
-    peak_memory_kb = _get_peak_memory_kb(stderr_text)
+    peak_memory_kb = _parse_peak_memory_kb(stderr_text)
 
     return {
         "compile_success": True,
@@ -472,41 +292,23 @@ def _run_exe(
 def compile_cpp_source(
     code: str,
     gpp_exe: str | None = None,
-    timeout_seconds: int = 30,
+    timeout_seconds: int = 10,
     enable_sanitizers: bool = True,
-    link_flags: list[str] | None = None,
 ) -> dict:
-    if "main" not in code and code.count("{") != code.count("}"):
-        return {
-            "success": False,
-            "errors": ["Compilation skipped: Unbalanced braces."],
-            "warnings": [],
-            "compilation_time_ms": 0,
-            "raw_stdout": "",
-            "raw_stderr": "Unbalanced braces detected.",
-            "compiler": "none"
-        }
+    """Compile C++ source code and return compiler diagnostics.
 
+    Parameters:
+    - code: complete C++ source text
+    - gpp_exe: optional explicit compiler path/name
+    - timeout_seconds: compile timeout
+    - enable_sanitizers: enable ASan/UBSan where available
+    """
     compiler_path = resolve_cpp_compiler(gpp_exe)
-    
-    caps = detect_compiler_capabilities(compiler_path)
-    if not caps.supports_cpp17:
-        raise RuntimeError(f"Compiler {compiler_path} does not support -std=c++17")
-        
-    if enable_sanitizers and not caps.supports_sanitizers:
-        _log.warning(f"Sanitizers not supported by compiler {compiler_path}; disabling.")
-        enable_sanitizers = False
-        
     _verify_compiler(compiler_path)
 
     start_time = time.time()
     with tempfile.TemporaryDirectory() as tmp_dir:
         cpp_path = os.path.join(tmp_dir, "modernized.cpp")
-        
-        implicit_headers = "#include <string>\n#include <memory>\n#include <vector>\n#include <optional>\n#include <new>\n#include <iostream>\n"
-        if "#include <new>" not in code:
-            code = implicit_headers + code
-
         with open(cpp_path, "w", encoding="utf-8") as cpp_file:
             cpp_file.write(code)
 
@@ -517,18 +319,27 @@ def compile_cpp_source(
             exe_name="modernized.exe",
             enable_sanitizers=enable_sanitizers,
             timeout_seconds=timeout_seconds,
-            link_flags=link_flags,
         )
 
     elapsed_ms = int((time.time() - start_time) * 1000)
     stderr_text = str(compile_result.get("stderr") or "")
     stdout_text = str(compile_result.get("stdout") or "")
 
-    success = bool(compile_result.get("compile_success", False))
+    if not compile_result.get("compile_success", False):
+        return {
+            "success": False,
+            "errors": stderr_text.splitlines() if stderr_text else ["Compilation failed."],
+            "warnings": [],
+            "compilation_time_ms": elapsed_ms,
+            "raw_stdout": stdout_text,
+            "raw_stderr": stderr_text,
+            "compiler": compiler_path,
+        }
+
     return {
-        "success": success,
-        "errors": [] if success else (stderr_text.splitlines() if stderr_text else ["Compilation failed."]),
-        "warnings": stdout_text.splitlines() if success and stdout_text else [],
+        "success": True,
+        "errors": [],
+        "warnings": stdout_text.splitlines() if stdout_text else [],
         "compilation_time_ms": elapsed_ms,
         "raw_stdout": stdout_text,
         "raw_stderr": stderr_text,
@@ -538,19 +349,23 @@ def compile_cpp_source(
 
 def _normalize_output(text: str) -> str:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    stripped_lines = [line.rstrip() for line in normalized.split("\n")]
+    lines = normalized.split("\n")
+    stripped_lines = [line.rstrip() for line in lines]
     while stripped_lines and stripped_lines[-1] == "":
         stripped_lines.pop()
     return "\n".join(stripped_lines)
 
 
 def _extract_error_location(stderr_text: str, source_label: str) -> str | None:
-    return next((line.strip() for line in stderr_text.splitlines() if source_label in line), None)
+    for line in stderr_text.splitlines():
+        if source_label in line:
+            return line.strip()
+    return None
 
 
 @dataclass
 class DifferentialTestResult:
-    success: bool
+    parity_ok: bool
     diff_text: str
     original: dict
     modernized: dict
@@ -569,21 +384,20 @@ def run_differential_test(
     gpp_exe: str | None = None,
     input_data: str | None = None,
     input_cases: list[str] | None = None,
-    compile_timeout_seconds: int = 30,
-    run_timeout_seconds: int = 30,
-    link_flags: list[str] | None = None,
+    compile_timeout_seconds: int = 10,
+    run_timeout_seconds: int = 10,
 ) -> dict:
+    """Compile original/modernized code once, run each test input, and compare parity.
+
+    Security note: this executes compiled binaries from provided source code.
+    Timeouts reduce risk but do not provide full sandbox isolation.
+    """
     compiler_path = resolve_cpp_compiler(gpp_exe)
-    
-    caps = detect_compiler_capabilities(compiler_path)
-    if not caps.supports_cpp17:
-        raise RuntimeError(f"Compiler {compiler_path} does not support -std=c++17")
-        
     _verify_compiler(compiler_path)
 
     if not os.path.isfile(original_cpp_path):
         return DifferentialTestResult(
-            success=False,
+            parity_ok=False,
             diff_text="",
             original={
                 "compile_success": False,
@@ -606,7 +420,7 @@ def run_differential_test(
 
     if not modernized_code.strip():
         return DifferentialTestResult(
-            success=False,
+            parity_ok=False,
             diff_text="",
             original={
                 "compile_success": False,
@@ -634,11 +448,6 @@ def run_differential_test(
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         modernized_cpp_path = os.path.join(tmp_dir, "modernized.cpp")
-        
-        implicit_headers = "#include <string>\n#include <memory>\n#include <vector>\n#include <optional>\n#include <new>\n#include <iostream>\n"
-        if "#include <new>" not in modernized_code:
-            modernized_code = implicit_headers + modernized_code
-
         with open(modernized_cpp_path, "w", encoding="utf-8") as file_handle:
             file_handle.write(modernized_code)
 
@@ -649,11 +458,10 @@ def run_differential_test(
             exe_name="original.exe",
             enable_sanitizers=False,
             timeout_seconds=compile_timeout_seconds,
-            link_flags=link_flags,
         )
         if not original_compile.get("compile_success", False):
             return DifferentialTestResult(
-                success=False,
+                parity_ok=False,
                 diff_text="Original code failed to compile. Please fix legacy source before differential testing.",
                 original={
                     "compile_success": False,
@@ -680,9 +488,8 @@ def run_differential_test(
             compiler_path=compiler_path,
             tmp_dir=tmp_dir,
             exe_name="modernized.exe",
-            enable_sanitizers=caps.supports_sanitizers,
+            enable_sanitizers=True,
             timeout_seconds=compile_timeout_seconds,
-            link_flags=link_flags,
         )
         if not modernized_compile.get("compile_success", False):
             modernized_stderr = str(modernized_compile.get("stderr") or "")
@@ -690,7 +497,7 @@ def run_differential_test(
             if location:
                 modernized_stderr = modernized_stderr + "\n" + f"First error location: {location}"
             return DifferentialTestResult(
-                success=False,
+                parity_ok=False,
                 diff_text="Modernized code failed to compile. See compiler diagnostics.",
                 original={
                     "compile_success": True,
@@ -772,7 +579,7 @@ def run_differential_test(
             if not original_case_result.get("run_success", False):
                 reason = str(original_case_result.get("crash_reason") or "original runtime failure")
                 return DifferentialTestResult(
-                    success=False,
+                    parity_ok=False,
                     diff_text=(
                         f"Case {case_index}: original program runtime failure: {reason}.\n"
                         + str(original_case_result.get("stderr", ""))
@@ -802,7 +609,7 @@ def run_differential_test(
             if not modernized_case_result.get("run_success", False):
                 reason = str(modernized_case_result.get("crash_reason") or "modernized runtime failure")
                 return DifferentialTestResult(
-                    success=False,
+                    parity_ok=False,
                     diff_text=(
                         f"Case {case_index}: modernized program runtime failure: {reason}.\n"
                         + str(modernized_case_result.get("stderr", ""))
@@ -877,10 +684,10 @@ def run_differential_test(
 
             memory_delta_kb: int | None = None
             if max_original_peak is not None and max_modernized_peak is not None:
-                memory_delta_kb = int(max_modernized_peak) - int(max_original_peak)
+                memory_delta_kb = max_modernized_peak - max_original_peak
 
             return DifferentialTestResult(
-                success=False,
+                parity_ok=False,
                 diff_text="".join(diff_parts),
                 original={
                     "compile_success": True,
@@ -897,7 +704,7 @@ def run_differential_test(
                     "cases": modernized_cases,
                 },
                 gpp_exe=compiler_path,
-                sanitizer_clean=not all_sanitizer_findings,
+                sanitizer_clean=False if all_sanitizer_findings else True,
                 sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
                 memory_delta_kb=memory_delta_kb,
                 test_cases_run=case_index + 1,
@@ -907,13 +714,11 @@ def run_differential_test(
 
         memory_delta_kb: int | None = None
         if max_original_peak is not None and max_modernized_peak is not None:
-            memory_delta_kb = int(max_modernized_peak) - int(max_original_peak)
-
-        sanitizer_clean = len(all_sanitizer_findings) == 0
+            memory_delta_kb = max_modernized_peak - max_original_peak
 
         return DifferentialTestResult(
-            success=sanitizer_clean,
-            diff_text="" if sanitizer_clean else (
+            parity_ok=len(all_sanitizer_findings) == 0,
+            diff_text="" if len(all_sanitizer_findings) == 0 else (
                 "All outputs matched, but sanitizer detected issues:\n"
                 + "\n".join(all_sanitizer_findings)
             ),
@@ -932,7 +737,7 @@ def run_differential_test(
                 "cases": modernized_cases,
             },
             gpp_exe=compiler_path,
-            sanitizer_clean=sanitizer_clean,
+            sanitizer_clean=len(all_sanitizer_findings) == 0,
             sanitizer_findings=all_sanitizer_findings if all_sanitizer_findings else None,
             memory_delta_kb=memory_delta_kb,
             test_cases_run=len(effective_input_cases),

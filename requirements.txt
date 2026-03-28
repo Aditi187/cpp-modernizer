@@ -1,14 +1,16 @@
 # Core workflow
 langgraph
 pydantic
+fastmcp
 
 # HTTP client (NVIDIA API)
 requests
+httpx
 
 # Environment variable loading
 python-dotenv
 
-# Web API (Vercel deployment)
+# Web API / Model Bridge
 fastapi
 uvicorn
 openai
