@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 """
-Multi-model LLM bridge for the Air-Gapped C++ Modernization Engine.
+Multi-model LLM bridge for the C++ Modernization Engine.
 
-Role routing (from .env):
-    analyze  → DeepSeek-V3   (deep reasoning, thinking mode)
-    modernize → Llama-3.3-70B (code rewriting)
-    fixer    → Llama-3.3-70B  (small compiler-error fixes)
+Supports three backends via .env:
+  - Ollama  (air-gapped, local):  OPENAI_ENDPOINT_BASE=http://localhost:11434/v1
+  - NVIDIA NIM (cloud, free tier): OPENAI_ENDPOINT_BASE=https://integrate.api.nvidia.com/v1
+  - OpenAI (cloud):                OPENAI_ENDPOINT_BASE=https://api.openai.com/v1
+
+Role routing:
+  analyze   -> role-specific model or fallback model
+  modernize -> role-specific model or fallback model
+  fixer     -> role-specific model or fallback model
+  planner   -> role-specific model or fallback model
 
 Falls back to RuleModernizer if LLM is unavailable / returns invalid code.
 """
@@ -25,6 +31,7 @@ from agents.workflow.context import WorkflowContext
 logger = logging.getLogger(__name__)
 
 from agents.workflow.infra.code_utils import extract_code, _CODE_FENCE_RE
+
 
 class ProviderError(Exception): pass
 class RateLimitError(ProviderError): pass
@@ -49,7 +56,7 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
-# Keys that look real but are placeholders — treat as missing
+# Keys that look real but are placeholders - treat as missing
 _PLACEHOLDER_KEYS = {
     "your_api_key_here",
     "nvapi-xxxx",
@@ -63,14 +70,39 @@ _PLACEHOLDER_KEYS = {
 }
 
 
+def _is_ollama_endpoint(base_url: str) -> bool:
+    """Returns True if the endpoint is a local Ollama server."""
+    return "localhost:11434" in base_url or "127.0.0.1:11434" in base_url
+
+
+def _is_valid_api_key(api_key: str, base_url: str) -> bool:
+    """
+    Returns True if the API key is usable.
+    
+    CRITICAL FIX: Ollama local endpoints accept ANY non-empty string as the API 
+    key (the server ignores it entirely). The old code was rejecting "ollama" as
+    a placeholder, silently disabling the LLM even when Ollama was running.
+    
+    For cloud endpoints (OpenAI, NVIDIA NIM), the key must be a real credential.
+    """
+    if not api_key:
+        return False
+    # Ollama ignores the key - any non-empty string is fine
+    if _is_ollama_endpoint(base_url):
+        return True
+    # Cloud providers need a real key, not a placeholder
+    return api_key not in _PLACEHOLDER_KEYS
+
+
 class _RoleConfig:
     """Holds the model/endpoint/key/params for one role."""
 
     def __init__(self, prefix: str, fallback_key: str, fallback_url: str, fallback_model: str):
         raw_key = _env(f"{prefix}_API_KEY") or _env(fallback_key)
-        # Treat placeholder strings exactly like a missing key
-        self.api_key   = raw_key if raw_key not in _PLACEHOLDER_KEYS else ""
-        self.base_url  = _env(f"{prefix}_ENDPOINT_BASE") or fallback_url
+        base_url = _env(f"{prefix}_ENDPOINT_BASE") or fallback_url
+        # FIXED: validate key against actual endpoint type, not just string match
+        self.api_key   = raw_key if _is_valid_api_key(raw_key, base_url) else ""
+        self.base_url  = base_url
         self.model     = _env(f"{prefix}_MODEL")     or fallback_model
         self.temp      = _env_float(f"{prefix}_TEMPERATURE", 0.1)
         self.top_p     = _env_float(f"{prefix}_TOP_P", 0.85)
@@ -81,7 +113,7 @@ class _RoleConfig:
         import httpx
         timeout_val = _env_float("LLM_TIMEOUT", 120.0)
         return OpenAI(
-            api_key=self.api_key, 
+            api_key=self.api_key,
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout_val, connect=10.0)
         )
@@ -95,21 +127,19 @@ def _get_role_config(role: str) -> _RoleConfig:
     configs = {
         "analyzer":  _RoleConfig("ANALYZER",   "API_KEY", _FALLBACK_URL, _env("ANALYZER_MODEL", fallback_model)),
         "modernizer": _RoleConfig("MODERNIZER", "API_KEY", _FALLBACK_URL, _env("MODERNIZER_MODEL", fallback_model)),
-        "fixer":     _RoleConfig("FIXER",      "API_KEY", _FALLBACK_URL, _env("FIXER_MODEL", fallback_model)),
-        "planner":   _RoleConfig("PLANNER",    "API_KEY", _FALLBACK_URL, _env("PLANNER_MODEL", fallback_model)),
+        "fixer":     _RoleConfig("FIXER",       "API_KEY", _FALLBACK_URL, _env("FIXER_MODEL", fallback_model)),
+        "planner":   _RoleConfig("PLANNER",     "API_KEY", _FALLBACK_URL, _env("PLANNER_MODEL", fallback_model)),
     }
     return configs.get(role, _RoleConfig("OPENAI", "API_KEY", _FALLBACK_URL, fallback_model))
 
 
 def _with_retry(fn, max_attempts: int = 3, base_wait: float = 5.0):
     last_err = None
-    # Optional inter-call courtesy delay (default: 0). Set LLM_SUCCESS_DELAY=5
-    # in .env only if you're hitting sustained rate limits across many files.
     success_delay = _env_float("LLM_SUCCESS_DELAY", 0.0)
-    
+
     import httpx
     import openai
-    
+
     for attempt in range(max_attempts):
         try:
             result = fn()
@@ -118,7 +148,6 @@ def _with_retry(fn, max_attempts: int = 3, base_wait: float = 5.0):
             return result
         except OpenAI_RateLimitError as e:
             last_err = e
-            # Exponential backoff capped at 120s
             wait = min((2 ** attempt) * base_wait, 120.0) + random.uniform(1.0, 5.0)
             logger.warning("Rate-limited (attempt %d/%d). Waiting %.1fs...", attempt + 1, max_attempts, wait)
             time.sleep(wait)
@@ -131,8 +160,7 @@ def _with_retry(fn, max_attempts: int = 3, base_wait: float = 5.0):
                 raise
         except Exception:
             raise
-    logger.error(f"Rate limit persisted after {max_attempts} attempts: {last_err}")
-    logger.error(f"[ERROR] ModelProvider: Rate limit persisted after {max_attempts} attempts.")
+    logger.error("Rate limit persisted after %d attempts: %s", max_attempts, last_err)
     raise RateLimitError(f"Rate limit persisted after {max_attempts} attempts: {last_err}")
 
 
@@ -140,8 +168,13 @@ def _call_llm(role: str, system: str, user: str, context: Optional[WorkflowConte
     cfg = _get_role_config(role)
 
     if not cfg.api_key:
-        logger.warning("No API key configured for role=%s (checked env vars: %s_API_KEY and API_KEY). Falling back to RuleModernizer.", role, role.upper())
-        logger.warning(f"[WARNING] ModelProvider: No API key for role={role} — LLM unavailable, using rule-based fallback.")
+        logger.warning(
+            "No usable API key for role=%s (endpoint=%s). Falling back to RuleModernizer.\n"
+            "  Ollama (local):  API_KEY=ollama  +  OPENAI_ENDPOINT_BASE=http://localhost:11434/v1\n"
+            "  OpenAI (cloud):  API_KEY=sk-...  +  OPENAI_ENDPOINT_BASE=https://api.openai.com/v1\n"
+            "  NVIDIA NIM:      API_KEY=nvapi-... + OPENAI_ENDPOINT_BASE=https://integrate.api.nvidia.com/v1",
+            role, cfg.base_url
+        )
         return None
 
     # Caching support
@@ -150,7 +183,7 @@ def _call_llm(role: str, system: str, user: str, context: Optional[WorkflowConte
         cache_key = f"{role}|{cfg.model}|{system}|{user}"
         cached = context.get_cached_llm_response(cache_key)
         if cached:
-            logger.info(f"[CACHE] LLM cache hit for role={role}")
+            logger.info("[CACHE] LLM cache hit for role=%s", role)
             if hasattr(context, "llm_calls_succeeded"):
                 context.llm_calls_succeeded += 1
             return cached
@@ -161,18 +194,13 @@ def _call_llm(role: str, system: str, user: str, context: Optional[WorkflowConte
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
         ]
-
-        # Use configured max_tokens
-        max_tokens = cfg.max_tokens
-
         kwargs = dict(
             model=cfg.model,
             messages=messages,
             temperature=cfg.temp,
             top_p=cfg.top_p,
-            max_tokens=max_tokens,
+            max_tokens=cfg.max_tokens,
         )
-
         if cfg.thinking and "deepseek" in str(cfg.model).lower():
             try:
                 resp = client.chat.completions.create(**kwargs, extra_body={"thinking": {"type": "enabled", "budget_tokens": 2048}})
@@ -180,7 +208,6 @@ def _call_llm(role: str, system: str, user: str, context: Optional[WorkflowConte
                 resp = client.chat.completions.create(**kwargs)
         else:
             resp = client.chat.completions.create(**kwargs)
-
         content = resp.choices[0].message.content or ""
         tokens = getattr(resp.usage, "total_tokens", 0) or 0
         return content, tokens
@@ -194,14 +221,11 @@ def _call_llm(role: str, system: str, user: str, context: Optional[WorkflowConte
                 context.llm_calls_succeeded += 1
             if cache_key:
                 context.cache_llm_response(cache_key, raw)
-        logger.info(f"[WORKING] ModelProvider: LLM call successful for role={role} (model={cfg.model}, tokens={tokens})")
+        logger.info("[WORKING] LLM call successful for role=%s (model=%s, tokens=%d)", role, cfg.model, tokens)
         return raw
     except Exception as e:
         logger.error("LLM call failed for role=%s: %s", role, e)
-        logger.error(f"[ERROR] ModelProvider: LLM call failed for role={role}: {e}")
         return None
-
-
 
 
 def _is_valid_cpp(code: str) -> bool:
@@ -210,10 +234,6 @@ def _is_valid_cpp(code: str) -> bool:
         return False
     return ("{" in s or ";" in s) and s != "NO_CHANGE"
 
-
-# ---------------------------------------------------------------------------
-# Public ModelClient — drop-in replacement for the old stub
-# ---------------------------------------------------------------------------
 
 class ModelClient:
     """Routes LLM calls by role; falls back to RuleModernizer for code roles."""
@@ -226,18 +246,16 @@ class ModelClient:
             cfg = _get_role_config("modernizer")
             if not cfg.api_key:
                 logger.warning(
-                    "⚠️  No valid API key found for the 'modernizer' role. "
-                    "LLM is DISABLED — output will be rule-based only (NULL→nullptr, "
-                    "headers, typedef→using, etc.). "
-                    "Set MODERNIZER_API_KEY (or API_KEY) to a real key in your .env file."
+                    "\u26a0\ufe0f  No usable API key for 'modernizer'. LLM DISABLED.\n"
+                    "    Output will be rule-based only (NULL->nullptr, headers, typedef->using, etc.)\n"
+                    "    To enable LLM:\n"
+                    "      Ollama: API_KEY=ollama + OPENAI_ENDPOINT_BASE=http://localhost:11434/v1\n"
+                    "      OpenAI: API_KEY=sk-... + OPENAI_ENDPOINT_BASE=https://api.openai.com/v1"
                 )
 
-    # ------------------------------------------------------------------
     def call(self, system_prompt: str, user_prompt: str, role: str = "modernizer", bypass_cache: bool = False) -> Optional[str]:
         logger.info("ModelClient.call  role=%-12s  llm=%s", role, self._use_llm)
-        logger.info(f"[WORKING] ModelClient: Requesting {role} (LLM enabled: {self._use_llm})")
 
-        # --- LLM path with exponential backoff and caching ---
         if self._use_llm:
             try:
                 raw = _call_llm(role, system_prompt, user_prompt, context=self.context, bypass_cache=bypass_cache)
@@ -248,11 +266,11 @@ class ModelClient:
                     else:
                         logger.warning("LLM output invalid, falling back to rules.")
             except RateLimitError as e:
-                logger.warning(f"429 Rate Limit hit ultimately: {e}")
+                logger.warning("429 Rate Limit: %s", e)
             except Exception as e:
-                logger.warning(f"LLM call failed: {e}")
+                logger.warning("LLM call failed: %s", e)
 
-        # --- Rule-based fallback (code roles only) ---
+        # Rule-based fallback (code roles only)
         if role in ("modernizer", "fixer"):
             matches = _CODE_FENCE_RE.findall(user_prompt)
             src = matches[-1] if matches else user_prompt
@@ -262,10 +280,10 @@ class ModelClient:
 
         return None
 
-    # ------------------------------------------------------------------
     def check_health(self) -> Tuple[bool, str]:
         parts = []
         for role in ["analyzer", "modernizer", "fixer", "planner"]:
             cfg = _get_role_config(role)
-            parts.append(f"{role}={cfg.model}")
+            key_status = "\u2713" if cfg.api_key else "\u2717 (no key)"
+            parts.append(f"{role}={cfg.model} [{key_status}]")
         return True, "Multi-model bridge: " + " | ".join(parts)
