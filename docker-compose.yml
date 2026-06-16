@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      target: runtime
+    image: cpp-modernizer:latest
+    container_name: cpp-modernizer-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env                     # Must exist — copy from .env.example
+    environment:
+      # Override ALLOWED_ORIGINS if needed
+      - ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+      - REDIS_URL=redis://redis:6379/0
+      - CACHE_DB_PATH=/app/data/.modernization_cache.db
+    depends_on:
+      - redis
+    volumes:
+      # Persist the LLM response cache across container restarts
+      - cache_data:/app/data
+      # Output directory for modernized files
+      - ./output:/app/output
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  redis:
+    image: redis:7-alpine
+    container_name: cpp-modernizer-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+volumes:
+  cache_data:

@@ -1,0 +1,9 @@
+.cpp-compiler/
+.modernization_state.db
+.modernization_cache.db
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+docs/internal/

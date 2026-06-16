@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard - C++ Modernization Studio</title>
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    .dashboard-container {
+      padding: 24px 32px;
+      max-width: 1200px;
+      margin: 0 auto;
+      flex: 1;
+      overflow-y: auto;
+      width: 100%;
+    }
+    .run-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    .run-table th, .run-table td {
+      padding: 12px 16px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    .run-table th {
+      background-color: var(--bg-subtle);
+      font-weight: 600;
+      color: var(--text-secondary);
+      text-transform: uppercase;
+      font-size: 12px;
+      letter-spacing: 0.05em;
+    }
+    .run-table tbody tr {
+      transition: background-color 0.2s;
+    }
+    .run-table tbody tr:hover {
+      background-color: var(--bg-subtle);
+      cursor: pointer;
+    }
+    .file-details {
+      margin-top: 24px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      box-shadow: var(--shadow-sm);
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-content" style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
+      <div class="brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+        <h1 style="margin-left: 8px;">C++ Modernization Studio - Dashboard</h1>
+      </div>
+      <div>
+        <input id="apiToken" placeholder="API Token" style="padding:8px 12px; border-radius:6px; border:1px solid var(--border); background: var(--bg-surface); color: var(--text-primary); margin-right: 12px;"> 
+        <button id="btnLoadRuns" class="btn-primary" style="margin-right: 12px;">Load Runs</button>
+        <a href="index.html" class="btn-secondary" style="text-decoration: none;">&larr; Back to Studio</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="dashboard-container">
+    <div class="panel" style="padding: 24px;">
+      <div style="font-size: 18px; font-weight: 600; margin-bottom: 16px; color: var(--text-primary);">Recent Runs</div>
+      <div style="overflow-x: auto;">
+        <table class="run-table" id="runsTable">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Started At</th>
+              <th>Files Processed</th>
+              <th>Passed</th>
+              <th>Failed</th>
+              <th>Skipped</th>
+              <th>Submitted By</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody id="runsBody">
+            <tr><td colspan="8" style="text-align: center; padding: 24px; color: var(--text-tertiary);">Loading runs...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div id="fileDetailsContainer" class="file-details" style="display: none;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+        <h2 style="font-size: 18px; font-weight: 600;">Run Details <span id="runIdLabel" style="color: var(--text-secondary);"></span></h2>
+        <a id="btnReport" href="#" target="_blank" class="btn-primary" style="text-decoration: none;">View Full HTML Report</a>
+      </div>
+      <div style="overflow-x: auto;">
+        <table class="run-table" id="filesTable">
+          <thead>
+            <tr>
+              <th>File Path</th>
+              <th>Status</th>
+              <th>Complexity</th>
+              <th>LLM Called</th>
+              <th>Attribution</th>
+              <th>Duration</th>
+            </tr>
+          </thead>
+          <tbody id="filesBody">
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>

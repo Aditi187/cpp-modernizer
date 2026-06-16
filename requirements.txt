@@ -1,0 +1,25 @@
+# Core workflow
+langgraph>=0.2.0
+pydantic>=2.0.0,<3.0.0
+fastmcp>=0.4.0,<0.5.0
+tree-sitter>=0.22.0,<0.24.0
+tree-sitter-cpp>=0.22.0,<0.24.0
+
+# HTTP client (NVIDIA API)
+requests>=2.30.0
+
+# Environment variable loading
+python-dotenv>=1.0.0
+
+# Web API / Model Bridge
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+openai>=1.0.0
+rich>=13.0.0
+# slowapi>=0.2.0,<0.3.0
+# redis>=5.0.0,<6.0.0
+# LangGraph checkpoint backends (SQLite for persistence, memory as fallback)
+langgraph-checkpoint-sqlite>=2.0.0
+
+# Required for FastAPI file upload endpoints (/modernize/file)
+python-multipart>=0.0.9

@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "air-gapped-codebase-modernization-engine"
+version = "0.2.0"
+description = "LLM-powered, compiler-verified C++17 modernization engine for legacy C/C++ codebases"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "langgraph>=0.2.0",
+    "pydantic>=2.0.0,<3.0.0",
+    "requests>=2.30.0",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "openai>=1.0.0",
+    "rich>=13.0.0",
+    "tree-sitter>=0.22.0,<0.24.0",
+    "tree-sitter-cpp>=0.22.0,<0.24.0",
+    "slowapi>=0.2.0,<0.3.0",
+    "redis>=5.0.0,<6.0.0",
+]
+
+
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0,<9.0.0",
+    "black>=23.0.0,<25.0.0",
+    "flake8>=6.0.0,<8.0.0",
+]
+mcp = ["fastmcp>=0.4.0,<0.5.0"]
+
+[project.scripts]
+modernization-engine = "cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["agents*", "core*"]
+exclude = ["tests*", "scripts*", "outputs*"]
+
+[tool.black]
+line-length = 88
+
+[tool.isort]
+profile = "black"
+
+[tool.pyright]
+pythonVersion = "3.12"
+extraPaths = ["."]
+typeCheckingMode = "basic"
+reportMissingImports = false
+reportMissingModuleSource = false
+reportGeneralTypeIssues = false
+reportAttributeAccessIssue = false
+reportOperatorIssue = false
+reportIndexIssue = false
+useLibraryCodeForTypes = true
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+norecursedirs = ["mingw64", "mingw", ".venv", ".git", "build", "dist"]
+addopts = "-v"

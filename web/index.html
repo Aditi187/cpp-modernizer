@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>C++ Modernization Studio</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-content">
+      <div class="brand">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>
+        <h1>C++ Modernization Studio</h1>
+      </div>
+      <div class="api-status" style="display: flex; align-items: center; gap: 12px;">
+        <input type="password" id="authToken" placeholder="API Token" style="padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border-color); background: var(--bg-tertiary); color: var(--text-primary); font-size: 12px; width: 120px;">
+        <a href="dashboard.html" style="color: var(--text-secondary); text-decoration: none; font-weight: 600;">View Dashboard</a>
+        <button id="btnDarkMode" style="background: none; border: none; cursor: pointer; color: var(--text-secondary);">🌓</button>
+      </div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- Left Sidebar: Controls & Pipeline -->
+    <aside class="sidebar">
+      
+      <div class="panel">
+        <div class="panel-header">Source Code</div>
+        <textarea id="codeInput" class="code-editor" spellcheck="false" placeholder="// Paste legacy C/C++ here..."></textarea>
+        <div class="panel-footer">
+          <label class="checkbox-label">
+            <input type="checkbox" id="skipVerify" checked>
+            Skip compiler check
+          </label>
+          <button id="btnModernize" class="btn-primary">Modernize</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-header">
+          Pipeline
+          <span class="pipeline-status-label" id="pipelineStageLabel">Idle</span>
+        </div>
+        <div class="pipeline">
+          <div class="pipeline-step" data-step="analyzer">
+            <div class="step-indicator"></div><div class="step-name">Analyze</div>
+          </div>
+          <div class="pipeline-step" data-step="planner">
+            <div class="step-indicator"></div><div class="step-name">Plan</div>
+          </div>
+          <div class="pipeline-step" data-step="modernizer">
+            <div class="step-indicator"></div><div class="step-name">Modernize</div>
+          </div>
+          <div class="pipeline-step" data-step="semantic_guard">
+            <div class="step-indicator"></div><div class="step-name">Guard</div>
+          </div>
+          <div class="pipeline-step" data-step="verifier">
+            <div class="step-indicator"></div><div class="step-name">Verify</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel metrics-panel" id="metricsPanel" style="opacity: 0;">
+        <div class="metric">
+          <div class="metric-value" id="mScoreVal">—</div>
+          <div class="metric-label">Score</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="mSafetyVal">—</div>
+          <div class="metric-label">Safety</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="mPatterns">—</div>
+          <div class="metric-label">Fixed</div>
+        </div>
+        <div class="metric">
+          <div class="metric-value" id="mTime">—</div>
+          <div class="metric-label">Time</div>
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- Main Content: Diff Viewer -->
+    <section class="main-content">
+      <div class="panel diff-panel">
+        <div class="panel-header">
+          <div class="diff-tabs">
+            <button class="diff-tab active" id="btnSplit">Split View</button>
+            <button class="diff-tab" id="btnUnified">Unified View</button>
+            <button class="diff-tab" id="btnDetails">Verification</button>
+          </div>
+          <div class="header-actions">
+            <button class="btn-secondary icon-btn" id="btnDarkMode" title="Toggle dark mode">🌙</button>
+            <button class="btn-secondary" id="btnCopy">Copy Modernized</button>
+          </div>
+        </div>
+        
+        <!-- Attribution Badge -->
+        <div class="attribution-container" id="attributionContainer" style="display: none;">
+          <span class="attribution-badge" id="attributionBadge"></span>
+        </div>
+        
+        <!-- Diff Content -->
+        <div class="diff-content" id="diffContainer">
+          <div class="empty-state">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#d0d7de" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            <p>Paste code and click Modernize to see the diff.</p>
+          </div>
+        </div>
+        
+        <!-- Verification Details Section -->
+        <div class="verification-details" id="verificationDetails" style="display: none;">
+          <div class="verification-header">
+            <span>🔍 Verification Details</span>
+            <span class="expand-icon">▼</span>
+          </div>
+          <div class="verification-content" id="verificationContent" style="display: none;">
+            <div class="verification-item">
+              <span class="verification-label">Compiler Status:</span>
+              <span class="verification-value" id="verificationCompiler">—</span>
+            </div>
+            <div class="verification-item">
+              <span class="verification-label">Semantic Guard:</span>
+              <span class="verification-value" id="verificationSemantic">—</span>
+            </div>
+            <div id="sanitizerContainer" style="display: none;" class="verification-item">
+              <span class="verification-label">Sanitizer Findings:</span>
+              <ul class="sanitizer-list" id="sanitizerFindings"></ul>
+            </div>
+            <details class="compiler-output">
+              <summary>Compiler Output</summary>
+              <pre id="compilerOutput"></pre>
+            </details>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="toastContainer" class="toast-container"></div>
+  <script src="app.js"></script>
+</body>
+</html>

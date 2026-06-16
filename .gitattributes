@@ -1,0 +1,33 @@
+# Normalize line endings to LF on checkout for all text files
+* text=auto
+
+# Python source — always LF
+*.py text eol=lf
+
+# Web assets — always LF
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+
+# Config/data files — always LF
+*.toml text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.cfg text eol=lf
+*.ini text eol=lf
+.env* text eol=lf
+
+# Binaries — never modify
+*.png binary
+*.jpg binary
+*.ico binary
+*.db binary
+*.pyc binary
+*.pyd binary
+*.so binary
+*.dll binary
+*.exe binary
