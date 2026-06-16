@@ -57,7 +57,7 @@ def verification_router(state: ModernizationState) -> str:
     logger.warning("[ROUTER] Verifier failed but no error log provided. Accepting current output to prevent infinite loop.")
     return END
 
-def build_modernization_graph(use_checkpointing: bool = True):
+def build_modernization_graph(use_checkpointing: bool = False):
     workflow = StateGraph(ModernizationState)
     
     workflow.add_node("analyzer", analyzer_node)
