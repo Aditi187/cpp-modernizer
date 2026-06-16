@@ -250,6 +250,20 @@ Use this checklist to ensure **zero outbound network calls** during modernizatio
 
 ---
 
+## 🎨 Web Dashboard (New!)
+
+The engine now includes a beautiful, fully interactive **C++ Modernization Studio** web UI! 
+Instead of staring at terminal output, you can visually track the modernization pipeline and compare the before/after C++ code using the built-in diff viewer.
+
+1. Start the API server:
+   ```bash
+   uvicorn api:app --port 8000
+   ```
+2. Open your browser and navigate to: **[http://127.0.0.1:8000](http://127.0.0.1:8000)**
+3. Paste your legacy C++ code into the left panel and click **Modernize**. Watch the pipeline execute in real-time and review the results in Split View or Unified View!
+
+---
+
 ## 💻 Usage
 
 ### Modernize a single file (defaults to C++17)
