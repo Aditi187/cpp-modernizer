@@ -29,6 +29,30 @@ MANDATORY_REQUIREMENTS = """1. LOGIC PARITY: Preserve every single calculation, 
 12. VECTOR CONVERSION: When migrating from raw arrays and dynamic allocation to std::vector, do NOT keep separate size/count member variables or initializers (like count(0)) unless specifically declared in the modernized header. Instead, use vector size (e.g., `.size()`), `.push_back()`, etc. directly to manage the collection.
 13. ALGORITHM TYPE COMPATIBILITY: When using standard library algorithms (like `std::remove_if` or `std::find_if`), ensure that the lambda or predicate parameter type matches the element type of the container exactly. For example, if a vector holds pointers (`std::vector<T*>`), the lambda parameter must be `T*` or `const T*`, NOT `const T&` or `T&`."""
 
+MODERNIZER_SYSTEM_PROMPT = """You are a C++ modernization engine. Your ONLY job is to rewrite legacy C++ to idiomatic C++17.
+
+STRICT OUTPUT RULES:
+- Output ONLY valid C++ code — no markdown, no explanation, no backticks
+- Preserve EVERY function, class, and method from the input
+- NEVER truncate or abbreviate code with "// ..." or similar
+- NEVER redeclare classes if modernizing a .cpp implementation file
+
+MANDATORY TRANSFORMATIONS (apply ALL of these):
+1. malloc/realloc/free -> std::vector, std::make_unique, std::make_shared
+2. new T / delete -> std::make_unique<T> / (remove delete — RAII handles it)
+3. char* -> std::string (for names/text); keep char* only in C-API boundaries
+4. NULL -> nullptr
+5. typedef -> using
+6. #define CONSTANT -> inline constexpr
+7. FILE* + fopen/fclose -> std::ofstream / std::ifstream (RAII)
+8. printf/fprintf -> std::cout / std::ofstream operator<<
+9. C-style callbacks (void*) -> std::function<>
+10. Raw arrays with separate size -> std::vector (remove the size variable)
+11. Linked lists (Node* next) -> std::vector (unless order or O(1) insert required)
+
+HEADERS: Add exactly the headers needed. Do not add unused headers.
+DESTRUCTOR: Remove manual delete/free — RAII handles cleanup automatically."""
+
 def _should_chunk(source: str) -> bool:
     """Return True if *source* exceeds the line threshold for chunked processing."""
     return source.count("\n") + 1 > _LINE_THRESHOLD
@@ -146,7 +170,7 @@ def _modernize_chunked(
 
             future = executor.submit(
                 client.call,
-                "You are AGENT 2: MODERNIZER. Modernize a single C++ function to idiomatic C++17. Output code only.",
+                MODERNIZER_SYSTEM_PROMPT,
                 prompt,
                 role="modernizer",
             )
@@ -339,7 +363,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
         try:
             raw_output = client.call(
-                "You are AGENT 2: MODERNIZER. Convert normalized C++ to idiomatic C++17. Output code only.",
+                MODERNIZER_SYSTEM_PROMPT,
                 prompt,
                 role="modernizer"
             )
