@@ -187,7 +187,7 @@ def _modernize_chunked(
 
         try:
             from concurrent.futures import TimeoutError as FutureTimeoutError
-            timeout_val = int(os.environ.get("MODERNIZER_CHUNK_TIMEOUT", "1200"))
+            timeout_val = int(os.environ.get("MODERNIZER_CHUNK_TIMEOUT", "300"))
             raw_output = future.result(timeout=timeout_val)
             if raw_output:
                 modernized_function = extract_code(raw_output)
