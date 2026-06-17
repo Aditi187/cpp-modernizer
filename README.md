@@ -66,3 +66,8 @@ python cli.py legacy_code.cpp
 python cli.py ./my_legacy_project/ --interactive
 ```
 
+---
+
+## 📄 License
+
+MIT License - see the [LICENSE](LICENSE) file for details.
